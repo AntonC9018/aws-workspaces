@@ -1,0 +1,11 @@
+{
+  "region": "eu-central-1",
+  "ami_id": "ami-0c228cd2b65888e1b",
+  "managed_by": "coder-workspaces",
+  "guard_name": "coder-workspaces-stop-guard",
+  "iam_user": "coder-workspaces-controller",
+  "coder_url": "http://127.0.0.1:7080",
+  "thread_base_url": "",
+  "github_owner": "",
+  "github_app_name": "AWS Workspaces"
+}

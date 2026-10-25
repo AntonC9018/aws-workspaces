@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "projects": [
+    {
+      "name": "app",
+      "path": "../my-project",
+      "revision": "HEAD",
+      "destination": "src/app",
+      "include_untracked": [],
+      "artifacts": ["dist", "build.log"]
+    }
+  ],
+  "files": []
+}
