@@ -21,6 +21,8 @@
       homeModules.default = { config, lib, pkgs, ... }: {
         imports = [ ./nix/home-manager.nix ];
         config = lib.mkIf config.programs.aws-workspaces.enable {
+          home.file.".agents/skills/aws-workspace".source = "${self}/skills/aws-workspace";
+          home.file.".codex/skills/aws-workspace".source = "${self}/skills/aws-workspace";
           home.packages = [ self.packages.${pkgs.stdenv.hostPlatform.system}.coder-aws
                             self.packages.${pkgs.stdenv.hostPlatform.system}.coder-trial ];
         };

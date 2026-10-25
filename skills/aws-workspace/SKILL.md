@@ -6,7 +6,10 @@ description: Offload builds and commands to Coder-managed AWS workers with bound
 # AWS workspaces
 
 Use `coder-aws` and `coder-trial` from PATH, or `nix run <checkout>#coder-aws --`.
-Read the repository's `docs/setup.md` for first deployment and configuration.
+The Home Manager installation links into the full pinned repository: resolve
+this skill directory with `realpath`, then go two directories up to find its
+flake and `docs/setup.md`. This also supplies a checkout path for `nix run` when
+the commands are not on PATH.
 Credentials stay outside Git and the Nix store. Never copy controller AWS keys,
 App signing keys or a broad personal GitHub token to a worker.
 

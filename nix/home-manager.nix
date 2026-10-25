@@ -12,7 +12,5 @@ in {
   };
   config = lib.mkIf cfg.enable {
     xdg.configFile."coder-workspaces/config.json".text = builtins.toJSON cfg.settings;
-    home.file.".agents/skills/aws-workspace".source = ../skills/aws-workspace;
-    home.file.".codex/skills/aws-workspace".source = ../skills/aws-workspace;
   };
 }
