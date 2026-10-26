@@ -73,7 +73,27 @@ def manifest(base, nonce, app_name="AWS Workspaces"):
             "redirect_url": base + "/callback", "setup_url": base + "/installed?state=" + nonce}
 
 
-def setup(directory, port=8786, owner="", app_name="AWS Workspaces"):
+def login_manifest(base, nonce, app_name, coder_url):
+    return {"name": app_name + " Login", "url": coder_url,
+            "description": "Sign in to your private Coder dashboard",
+            "public": False, "default_permissions": {"email_addresses": "read"},
+            "default_events": [], "request_oauth_on_install": False,
+            "redirect_url": base + "/callback",
+            "callback_urls": [coder_url + "/api/v2/users/oauth2/github/callback"]}
+
+
+def login_environment(app, coder_url):
+    values = {"CODER_OAUTH2_GITHUB_CLIENT_ID": app["client_id"],
+              "CODER_OAUTH2_GITHUB_CLIENT_SECRET": app["client_secret"],
+              "CODER_ACCESS_URL": coder_url,
+              "CODER_OAUTH2_GITHUB_DEVICE_FLOW": "false",
+              "CODER_OAUTH2_GITHUB_DEFAULT_PROVIDER_ENABLE": "false",
+              "CODER_OAUTH2_GITHUB_ALLOW_EVERYONE": "true",
+              "CODER_OAUTH2_GITHUB_ALLOW_SIGNUPS": "false"}
+    return "".join(key + "=" + json.dumps(value) + "\n" for key, value in values.items())
+
+
+def setup(directory, port=8786, owner="", app_name="AWS Workspaces", login_url=None):
     """Serve a bounded loopback-only consent flow; never log callback secrets."""
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     directory.chmod(0o700)
@@ -103,15 +123,21 @@ def setup(directory, port=8786, owner="", app_name="AWS Workspaces"):
                 return
             try:
                 if parsed.path == "/":
-                    if (directory / "app.json").exists():
+                    if login_url and (directory / "login.env").exists():
+                        self.page("<p>Dashboard login is already configured. Restart Coder to apply saved credentials.</p>")
+                        completed = True
+                    elif (directory / "app.json").exists():
                         app = json.loads((directory / "app.json").read_text())
                         self.page('<a href="' + html.escape(app["html_url"] + "/installations/new") + '">Install the existing App on your repositories</a>')
                     else:
-                        value = html.escape(json.dumps(manifest(base, nonce, app_name)), quote=True)
-                        self.page('<h1>GitHub access for AWS workspaces</h1><p>Create a private App in your main account, '
+                        definition = login_manifest(base, nonce, app_name, login_url) if login_url else manifest(base, nonce, app_name)
+                        value = html.escape(json.dumps(definition), quote=True)
+                        intro = ("<h1>GitHub dashboard login</h1><p>Create your own login App. It requests read-only email access, with no repository access. Credentials are saved locally.</p>"
+                                 if login_url else '<h1>GitHub access for AWS workspaces</h1><p>Create a private App in your main account, '
                                   'then install it on all or selected repositories. The App permits contents read/write; worker '
                                   'tokens default to read-only and write tokens require an explicit agent command. '
-                                  'Commit authors remain your configured agent account.</p>'
+                                  'Commit authors remain your configured agent account.</p>')
+                        self.page(intro +
                                   '<form method="post" action="https://github.com/settings/apps/new?state=' + nonce + '">'
                                   '<input type="hidden" name="manifest" value="' + value + '">'
                                   '<button>Create GitHub App</button></form>')
@@ -122,6 +148,12 @@ def setup(directory, port=8786, owner="", app_name="AWS Workspaces"):
                     app = request("/app-manifests/" + code + "/conversions", payload={})
                     if not app["html_url"].startswith("https://github.com/apps/"):
                         raise ValueError("Unexpected App URL")
+                    if login_url:
+                        save(directory / "login.env", login_environment(app, login_url))
+                        save(directory / "login-app.json", json.dumps({k: app[k] for k in ("id", "slug", "html_url")}))
+                        self.page("<p>Login App created. Credentials saved privately. You can return to the agent to finish switching Coder.</p>")
+                        completed = True
+                        return
                     save(directory / "private-key.pem", app["pem"])
                     save(directory / "app.json", json.dumps({k: app[k] for k in ("id", "slug", "html_url")}, indent=2))
                     self.page('<p>App created. Its private key is saved locally.</p><a href="' +

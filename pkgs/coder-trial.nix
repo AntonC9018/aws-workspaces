@@ -83,6 +83,7 @@ let
     CacheDirectory=coder-trial
     Environment=CODER_HTTP_ADDRESS=127.0.0.1:7080
     Environment=CODER_ACCESS_URL=http://127.0.0.1:7080
+    EnvironmentFile=-%h/.local/state/coder-workspaces/github-login/login.env
     Environment="CODER_PG_CONNECTION_URL=user=%u dbname=coder host=%t/coder-trial-postgres port=54329 sslmode=disable"
     Environment=CODER_TELEMETRY_ENABLE=false
     Environment=CODER_UPDATE_CHECK=false

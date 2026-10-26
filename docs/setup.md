@@ -42,6 +42,21 @@ This installs the commands, settings and agent skill. Other setups can link
 `skills/aws-workspace` into their agent's skills directory. Read the skill before
 letting an agent provision machines.
 
+## Dashboard login through GitHub
+
+`coder-aws github-login-setup` prepares a private GitHub login App with read-only
+email permission and no repository access. Open the printed local page and
+approve App creation while signed into GitHub. This uses the App manifest flow
+so generated client credentials are saved directly, without copying secrets.
+It is separate from the repository-token App created by `github-setup`.
+
+After registration, restart `coder-trial.service`. It reads the private
+`~/.local/state/coder-workspaces/github-login/login.env`, disables Coder's shared
+login provider and device flow, and uses browser redirects to the configured
+`coder_url`. New-user signups remain disabled; existing users can sign in.
+The repository-token App and saved CLI sessions are unchanged. Worker bootstrap
+continues to use its loopback reverse tunnel rather than the browser URL.
+
 ## Browser sessions
 
 Browser sessions default to 24 hours and renew with activity. Set

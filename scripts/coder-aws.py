@@ -640,6 +640,8 @@ def main():
     sub.add_parser("publish-template")
     sub.add_parser("reconcile")
     sub.add_parser("configure-auth")
+    github_login = sub.add_parser("github-login-setup")
+    github_login.add_argument("--port", type=int, default=8787)
     github_setup = sub.add_parser("github-setup")
     github_setup.add_argument("--port", type=int, default=8786)
     plan_command = sub.add_parser("plan")
@@ -668,15 +670,16 @@ def main():
     separator = cli.index("--") if "--" in cli else len(cli)
     job_command = cli[separator + 1:]
     args = parser.parse_args(cli[:separator])
-    if args.action == "github-setup":
+    if args.action in ("github-setup", "github-login-setup"):
         STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
         setup_lock = (STATE / "github-setup.lock").open("a")
         try:
             fcntl.flock(setup_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise RuntimeError("GitHub setup is already running; use its existing setup URL")
-        library("github").setup(STATE / "github", args.port, owner=SETTINGS["github_owner"],
-                                app_name=SETTINGS["github_app_name"])
+        library("github").setup(STATE / ("github-login" if args.action == "github-login-setup" else "github"),
+                                args.port, owner=SETTINGS["github_owner"], app_name=SETTINGS["github_app_name"],
+                                login_url=SETTINGS["coder_url"] if args.action == "github-login-setup" else None)
         return
     if args.action == "plan":
         print(json.dumps(transfer_library().inventory(args.manifest), indent=2))

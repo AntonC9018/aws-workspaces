@@ -72,6 +72,16 @@ class GitHubTests(unittest.TestCase):
             path.write_text(json.dumps(valid))
             self.assertIsNone(helper.lookup(values, root))
 
+    def test_dashboard_login_requests_email_without_repository_access(self):
+        value = app.login_manifest("http://127.0.0.1:8787", "nonce", "Workspaces", "https://coder.example.com")
+        self.assertEqual(value["default_permissions"], {"email_addresses": "read"})
+        self.assertEqual(value["callback_urls"], ["https://coder.example.com/api/v2/users/oauth2/github/callback"])
+        self.assertNotIn("hook_attributes", value)
+        environment = app.login_environment({"client_id": "test-id", "client_secret": "test-secret"}, "https://coder.example.com")
+        self.assertIn('CODER_OAUTH2_GITHUB_DEVICE_FLOW="false"', environment)
+        self.assertIn('CODER_OAUTH2_GITHUB_DEFAULT_PROVIDER_ENABLE="false"', environment)
+        self.assertIn('CODER_OAUTH2_GITHUB_ALLOW_SIGNUPS="false"', environment)
+
     def test_app_manifest_uses_private_app_and_no_user_oauth(self):
         value = app.manifest("http://127.0.0.1:8786", "nonce")
         self.assertFalse(value["public"])
