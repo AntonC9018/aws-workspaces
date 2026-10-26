@@ -4,6 +4,8 @@ let
   startServer = writeShellScript "coder-trial-start-server" ''
     set -eu
     export CODER_SESSION_DURATION="$(${python3}/bin/python3 ${../scripts/coder_workspace/settings.py} session_duration)"
+    sessionHours="''${CODER_SESSION_DURATION%h}"
+    export CODER_DEFAULT_OAUTH_REFRESH_LIFETIME="$((sessionHours + 24))h"
     export CODER_DISABLE_SESSION_EXPIRY_REFRESH=false
     exec ${coder}/bin/coder --global-config "$HOME/.local/state/coder-trial/server" server --cache-dir "$HOME/.cache/coder-trial"
   '';
