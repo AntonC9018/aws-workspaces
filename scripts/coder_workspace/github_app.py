@@ -76,7 +76,7 @@ def manifest(base, nonce, app_name="AWS Workspaces"):
 def login_manifest(base, nonce, app_name, coder_url):
     return {"name": app_name + " Login", "url": coder_url,
             "description": "Sign in to your private Coder dashboard",
-            "public": False, "default_permissions": {"email_addresses": "read"},
+            "public": False, "default_permissions": {"emails": "read"},
             "default_events": [], "request_oauth_on_install": False,
             "redirect_url": base + "/callback",
             "callback_urls": [coder_url + "/api/v2/users/oauth2/github/callback"]}

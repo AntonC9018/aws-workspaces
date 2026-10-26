@@ -74,7 +74,7 @@ class GitHubTests(unittest.TestCase):
 
     def test_dashboard_login_requests_email_without_repository_access(self):
         value = app.login_manifest("http://127.0.0.1:8787", "nonce", "Workspaces", "https://coder.example.com")
-        self.assertEqual(value["default_permissions"], {"email_addresses": "read"})
+        self.assertEqual(value["default_permissions"], {"emails": "read"})
         self.assertEqual(value["callback_urls"], ["https://coder.example.com/api/v2/users/oauth2/github/callback"])
         self.assertNotIn("hook_attributes", value)
         environment = app.login_environment({"client_id": "test-id", "client_secret": "test-secret"}, "https://coder.example.com")
