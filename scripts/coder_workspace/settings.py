@@ -7,6 +7,7 @@ import sys
 from urllib.parse import urlsplit
 
 DEFAULTS = {
+    "session_duration": "24h",
     "region": "eu-central-1",
     "ami_id": "ami-0c228cd2b65888e1b",
     "managed_by": "coder-workspaces",
@@ -30,6 +31,8 @@ def load(path=None):
     settings = DEFAULTS | supplied
     if settings["region"] != DEFAULTS["region"] and "ami_id" not in supplied:
         raise ValueError("Set ami_id when selecting a different AWS region")
+    if not re.fullmatch(r"[1-9][0-9]{0,5}h", settings["session_duration"]) or int(settings["session_duration"][:-1]) > 876000:
+        raise ValueError("session_duration must be 1–876000 hours, for example 24h")
     for key in ("managed_by", "guard_name", "iam_user"):
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", settings[key]):
             raise ValueError(f"Invalid {key}")

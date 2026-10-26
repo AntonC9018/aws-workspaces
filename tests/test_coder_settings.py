@@ -27,8 +27,14 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(loaded["managed_by"], values["managed_by"])
         self.assertEqual(loaded["coder_url"], "https://coder.example.com")
 
+    def test_long_browser_session_is_configurable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps({"session_duration": "876000h"}))
+            self.assertEqual(settings.load(path)["session_duration"], "876000h")
+
     def test_invalid_configuration_fails_before_aws_operations(self):
-        for value in ({"region": "us-east-1"}, {"managed_by": "../bad"},
+        for value in ({"session_duration": "0h"}, {"session_duration": "876001h"}, {"region": "us-east-1"}, {"managed_by": "../bad"},
                       {"coder_url": "https://user:secret@example.com"}, {"unknown": "value"}):
             with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / "config.json"

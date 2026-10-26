@@ -42,6 +42,16 @@ This installs the commands, settings and agent skill. Other setups can link
 `skills/aws-workspace` into their agent's skills directory. Read the skill before
 letting an agent provision machines.
 
+## Browser sessions
+
+Browser sessions default to 24 hours and renew with activity. Set
+`session_duration` to a duration in whole hours, such as `8760h` for a year,
+then restart `coder-trial.service`. The maximum supported setting is `876000h`.
+This is a long expiry, not an immortal credential: logout, revocation and clearing
+browser cookies still end the session. Existing short-lived sessions may need
+one new login to receive the new lifetime. Use the same dashboard hostname;
+localhost and a tailnet hostname have separate browser cookies.
+
 ## Network and threads
 
 `coder-trial tailnet` exposes the dashboard privately through Tailscale Serve

@@ -1,6 +1,12 @@
 { writeShellApplication, writeShellScript, writeTextDir, coder, postgresql_16, systemd, coreutils, curl, awscli2, coder-aws, tailscale, python3 }:
 let
   postgres = postgresql_16;
+  startServer = writeShellScript "coder-trial-start-server" ''
+    set -eu
+    export CODER_SESSION_DURATION="$(${python3}/bin/python3 ${../scripts/coder_workspace/settings.py} session_duration)"
+    export CODER_DISABLE_SESSION_EXPIRY_REFRESH=false
+    exec ${coder}/bin/coder --global-config "$HOME/.local/state/coder-trial/server" server --cache-dir "$HOME/.cache/coder-trial"
+  '';
   awsCredentials = writeShellScript "coder-aws-credentials" ''
     region="$(${python3}/bin/python3 ${../scripts/coder_workspace/settings.py} region)"
     if [ -f "$HOME/.aws/coder-workspaces.credentials" ]; then
@@ -80,7 +86,7 @@ let
     Environment=CODER_UPDATE_CHECK=false
     Environment=CODER_PROVISIONER_DAEMONS=1
     Environment=AWS_CONFIG_FILE=${awsConfig}/config AWS_PROFILE=coder-workspaces AWS_SDK_LOAD_CONFIG=1
-    ExecStart=${coder}/bin/coder --global-config %h/.local/state/coder-trial/server server --cache-dir %h/.cache/coder-trial
+    ExecStart=${startServer}
     Restart=on-failure
     RestartSec=3
     TimeoutStopSec=30
