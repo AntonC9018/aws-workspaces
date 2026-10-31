@@ -126,6 +126,14 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(termination[0]["Condition"],
                          {"StringEquals": {"ec2:ResourceTag/ManagedBy": "coder-workspaces"}})
         self.assertFalse(any(a.startswith("iam:") or a == "*" for a in allowed))
+        removal = next(s for s in policy["Statement"]
+                       if s["Effect"] == "Allow" and "ec2:DeleteTags" in s["Action"])
+        self.assertEqual(removal["Condition"],
+                         {"StringEquals": {"ec2:ResourceTag/ManagedBy": "coder-workspaces"}})
+        ownership = next(s for s in policy["Statement"]
+                         if s["Effect"] == "Deny" and s["Action"] == "ec2:DeleteTags")
+        self.assertEqual(ownership["Condition"],
+                         {"ForAnyValue:StringEquals": {"aws:TagKeys": "ManagedBy"}})
         runtime = next(s for s in policy["Statement"] if "ec2:StopInstances" in s["Action"])
         self.assertEqual(runtime["Condition"]["StringEquals"]["ec2:ResourceTag/ManagedBy"], "coder-workspaces")
 
