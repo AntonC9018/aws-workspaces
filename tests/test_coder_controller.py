@@ -97,11 +97,34 @@ class ControllerTests(unittest.TestCase):
             controller.reconcile()
             connect.assert_not_called()
 
-    def test_controller_has_no_iam_or_termination_authority(self):
+    def test_upgrade_applies_active_template_without_starting_worker(self):
+        with patch.object(controller, "instance", return_value={"State": {"Name": "stopped"}}), \
+                patch.object(controller, "api", return_value={"latest_build": {"job": {"status": "failed"}}}), \
+                patch.object(controller, "transition") as transition:
+            controller.upgrade(Mock(), "smoke")
+            transition.assert_called_once_with("smoke", "stop")
+
+    def test_upgrade_rejects_running_worker_or_in_progress_build(self):
+        for state, job in (("running", "succeeded"), ("stopped", "running")):
+            with self.subTest(state=state, job=job), \
+                    patch.object(controller, "instance", return_value={"State": {"Name": state}}), \
+                    patch.object(controller, "api", return_value={"latest_build": {"job": {"status": job}}}), \
+                    patch.object(controller, "transition") as transition:
+                with self.assertRaises(RuntimeError):
+                    controller.upgrade(Mock(), "smoke")
+                transition.assert_not_called()
+
+    def test_controller_can_terminate_only_owned_instances_without_iam_authority(self):
         policy = controller.controller_policy("123456789012", {"vpc": "vpc-owned", "ids": ["subnet-owned"]})
         allowed = [a for s in policy["Statement"] if s["Effect"] == "Allow"
                    for a in (s["Action"] if isinstance(s["Action"], list) else [s["Action"]])]
-        self.assertNotIn("ec2:TerminateInstances", allowed)
+        termination = [s for s in policy["Statement"]
+                       if s["Effect"] == "Allow" and "ec2:TerminateInstances" in s["Action"]]
+        self.assertEqual(len(termination), 1)
+        self.assertEqual(termination[0]["Resource"],
+                         "arn:aws:ec2:eu-central-1:123456789012:instance/*")
+        self.assertEqual(termination[0]["Condition"],
+                         {"StringEquals": {"ec2:ResourceTag/ManagedBy": "coder-workspaces"}})
         self.assertFalse(any(a.startswith("iam:") or a == "*" for a in allowed))
         runtime = next(s for s in policy["Statement"] if "ec2:StopInstances" in s["Action"])
         self.assertEqual(runtime["Condition"]["StringEquals"]["ec2:ResourceTag/ManagedBy"], "coder-workspaces")

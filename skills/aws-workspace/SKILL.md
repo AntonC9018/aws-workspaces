@@ -34,7 +34,9 @@ coder-aws resume build
 Jobs are detached systemd services. Use a shell explicitly for shell syntax.
 One registered job runs per worker. Choose RAM for the actual work and avoid
 unneeded capacity. Do not upgrade the AWS Free plan. Stopping preserves disks;
-storage still consumes credits. No automatic deletion is configured.
+storage still consumes credits. Explicit dashboard Delete or `coder delete NAME`
+permanently removes the instance and root disk. Fetch needed results first.
+No automatic deletion is configured.
 
 `connect` restores a bridge to a running worker; `resume` starts a stopped one.
 Do not expose dashboards or previews publicly. Use the existing IPv4 networking;

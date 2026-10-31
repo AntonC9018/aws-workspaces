@@ -140,7 +140,7 @@ resource "aws_instance" "workspace" {
     volume_type           = "gp3"
     volume_size           = 30
     encrypted             = true
-    delete_on_termination = false
+    delete_on_termination = true
   }
   # RunInstances must carry volume tags for the controller's ownership policy.
   # root_block_device.tags applies them only after launch, which IAM rejects.
@@ -198,7 +198,6 @@ resource "aws_instance" "workspace" {
     # Explicit start/stop reconciliations refresh the startup allowance.
     # EC2 reports this false while stopped; it must not cause replacement.
     ignore_changes  = [associate_public_ip_address, tags["SourceSnapshot"], tags["SourceProjects"]]
-    prevent_destroy = true
   }
 }
 

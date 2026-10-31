@@ -15,7 +15,8 @@ Lambda, EventBridge and EC2 resources. It deploys the stop guard and publishes
 the `aws-private` Coder template. Then run `coder-aws configure-auth` to create
 a restricted IAM controller key in `~/.aws/coder-workspaces.credentials`, mode
 0600. Routine operations use that key; bootstrap still uses the default AWS
-profile. The restricted policy cannot terminate instances or administer IAM.
+profile. The restricted policy can terminate only instances carrying this deployment's
+ownership tag and cannot administer IAM.
 
 Configuration lives in `~/.config/coder-workspaces/config.json`. It contains
 non-secret settings only. See [the example](../examples/config.json). Defaults
@@ -111,3 +112,18 @@ token is copied to a worker.
 
 References: [App manifests](https://docs.github.com/en/apps/sharing-github-apps/registering-a-github-app-from-a-manifest),
 [installation tokens](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-an-installation-access-token-for-a-github-app).
+
+## Upgrading existing workspaces for permanent deletion
+
+After upgrading the controller, run `coder-aws configure-auth` to update its
+owned-instance termination permission, then `coder-aws publish-template`.
+New workspaces delete their root disk when terminated.
+
+Existing workspaces must apply the new template before deletion. For a stopped
+workspace, run `coder-aws upgrade NAME`. This
+updates the disk's deletion flag in place without starting the worker. For a
+running workspace, finish or fetch active work before updating it. Verify the
+root block device has `DeleteOnTermination=true` in EC2 before deleting.
+
+Use the dashboard Delete action or `coder delete NAME --yes`. Stopping keeps
+the disk; deleting permanently removes it. Do not use `--orphan` for cleanup.

@@ -80,6 +80,8 @@ def controller_policy(account, subnets):
             "ec2:AuthorizeSecurityGroupIngress", "ec2:AuthorizeSecurityGroupEgress", "ec2:RevokeSecurityGroupIngress",
             "ec2:RevokeSecurityGroupEgress", "ec2:DeleteSecurityGroup", "ec2:DeleteKeyPair", "ec2:CreateTags"],
          "Resource": resources, "Condition": tagged},
+        {"Effect": "Allow", "Action": "ec2:TerminateInstances",
+         "Resource": prefix + "instance/*", "Condition": tagged},
         {"Effect": "Allow", "Action": ["ec2:CreateSecurityGroup", "ec2:ImportKeyPair"],
          "Resource": [prefix + "security-group/*", prefix + "key-pair/*"],
          "Condition": {"StringEquals": {"aws:RequestTag/ManagedBy": MANAGER}}},
@@ -313,6 +315,19 @@ def transition(name, action, parameters=None):
             raise RuntimeError(f"Coder {action} failed: {build['job'].get('error', 'inspect dashboard build logs')}")
         time.sleep(2)
     raise RuntimeError(f"Coder {action} did not finish within six minutes; inspect dashboard")
+
+
+
+def upgrade(session, name):
+    """Apply the active template to a stopped worker without starting it."""
+    machine = instance(session, name)
+    if machine["State"]["Name"] != "stopped":
+        raise RuntimeError("Stop the workspace before upgrading its template")
+    workspace = api("users/me/workspace/" + name)
+    if workspace["latest_build"]["job"]["status"] not in ("succeeded", "failed", "canceled"):
+        raise RuntimeError("Wait for the current workspace build before upgrading")
+    transition(name, "stop")
+    print(f"{name}: active template applied; workspace remains stopped")
 
 
 def renew(session, machine, seconds, preserve=True):
@@ -646,7 +661,7 @@ def main():
     github_setup.add_argument("--port", type=int, default=8786)
     plan_command = sub.add_parser("plan")
     plan_command.add_argument("--manifest", required=True)
-    for action in ("authorize", "create", "sync", "link", "links", "resume", "connect", "stop", "status", "hold", "extend", "run", "fetch"):
+    for action in ("authorize", "create", "sync", "link", "links", "resume", "connect", "stop", "upgrade", "status", "hold", "extend", "run", "fetch"):
         command = sub.add_parser(action)
         command.add_argument("workspace")
         if action == "authorize":
@@ -716,6 +731,9 @@ def main():
         return
     if args.action in ("setup", "publish-template"):
         publish(session, refresh_guard=args.action == "setup")
+        return
+    if args.action == "upgrade":
+        upgrade(session, args.workspace)
         return
     if args.action in ("create", "resume"):
         assert_guard(session)

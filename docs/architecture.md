@@ -2,7 +2,9 @@
 
 Coder stores Terraform state in local PostgreSQL. The template creates an EC2
 instance, encrypted 30 GiB gp3 root disk, security group and SSH key pair. Guest
-shutdown stops the instance. Terraform forbids replacement and retains the disk.
+shutdown stops the instance and retains its disk. Explicit workspace deletion
+permanently terminates the instance and deletes its root disk, security group
+and SSH key pair. Fetch valuable results before deleting a workspace.
 Back up the Coder database before relying on valuable long-lived workspaces;
 this project does not configure a remote database backup.
 
