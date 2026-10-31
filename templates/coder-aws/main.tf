@@ -141,12 +141,14 @@ resource "aws_instance" "workspace" {
     volume_size           = 30
     encrypted             = true
     delete_on_termination = false
-    tags = merge(local.origin_tags, {
-      ManagedBy     = var.managed_by
-      WorkspaceId   = data.coder_workspace.me.id
-      WorkspaceName = data.coder_workspace.me.name
-    })
   }
+  # RunInstances must carry volume tags for the controller's ownership policy.
+  # root_block_device.tags applies them only after launch, which IAM rejects.
+  volume_tags = merge(local.origin_tags, {
+    ManagedBy     = var.managed_by
+    WorkspaceId   = data.coder_workspace.me.id
+    WorkspaceName = data.coder_workspace.me.name
+  })
   user_data_base64 = base64gzip("#cloud-config\n${jsonencode({
     package_update = true
     packages       = ["git", "rsync", "curl", "python3", "zsh"]
