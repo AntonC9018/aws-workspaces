@@ -58,6 +58,12 @@ edits. Inspect results and merge or cherry-pick deliberately. If the controller
 was off, fetch when the agent returns. There is no background retrieval or
 implicit push.
 
+Never stream raw binary files (such as PNGs or archives) over `coder ssh`
+stdout: `coder ssh` allocates a PTY that translates `\n` to `\r\n`, corrupting
+binary files and breaking downstream image-read tools. Transfer images and other
+binaries with `coder-aws fetch` (declared as manifest artifacts), `scp`, or
+`base64` (`coder ssh NAME -- 'base64 FILE' | tr -d '\r' | base64 -d > FILE`).
+
 ## Threads and Git
 
 For T3 tasks, obtain the app thread ID from `t3_thread_configuration` and pass
