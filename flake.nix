@@ -3,21 +3,22 @@
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/da6dc0e7b260";
   outputs = { self, nixpkgs }:
     let
-      system = "x86_64-linux";
-      pkgs = import nixpkgs {
+      # The controller runs on the x86 laptop or the aarch64 Oracle control center.
+      forSystems = f: nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" ] (system: f (import nixpkgs {
         inherit system;
         config.allowUnfreePredicate = pkg: nixpkgs.lib.getName pkg == "terraform";
-      };
-      coderAws = pkgs.callPackage ./pkgs/coder-aws.nix { };
+      }));
     in {
-      packages.${system} = {
-        default = coderAws;
-        coder-aws = coderAws;
-        coder-trial = pkgs.callPackage ./pkgs/coder-trial.nix { coder-aws = coderAws; };
-      };
-      devShells.${system}.default = pkgs.mkShell {
-        packages = [ (pkgs.python3.withPackages (p: [ p.boto3 p.pyyaml ])) pkgs.git pkgs.openssl pkgs.terraform ];
-      };
+      packages = forSystems (pkgs: rec {
+        default = coder-aws;
+        coder-aws = pkgs.callPackage ./pkgs/coder-aws.nix { };
+        coder-trial = pkgs.callPackage ./pkgs/coder-trial.nix { inherit coder-aws; };
+      });
+      devShells = forSystems (pkgs: {
+        default = pkgs.mkShell {
+          packages = [ (pkgs.python3.withPackages (p: [ p.boto3 p.pyyaml ])) pkgs.git pkgs.openssl pkgs.terraform ];
+        };
+      });
       homeModules.default = { config, lib, pkgs, ... }: {
         imports = [ ./nix/home-manager.nix ];
         config = lib.mkIf config.programs.aws-workspaces.enable {
