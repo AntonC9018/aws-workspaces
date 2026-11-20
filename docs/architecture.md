@@ -26,10 +26,9 @@ are not atomic. Extend leases before they are close to expiry. Shutdown timing
 is approximate.
 
 The default sizes are `t3.small`, `c7i-flex.large` and `m7i-flex.large`. Choose
-sufficient RAM for the job and avoid idle capacity. Account eligibility is
-checked against the active AWS Free plan. Service availability and free-credit
-terms depend on the account; the controller refuses paid-plan accounts and
-never upgrades a plan.
+sufficient RAM for the job and avoid idle capacity. Service availability and
+credit terms depend on the AWS account; the controller never changes the
+account plan.
 
 Stopping loses RAM and processes but keeps committed files and job records.
 Storage and managed services may still consume credits. There is no retention

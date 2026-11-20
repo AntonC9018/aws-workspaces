@@ -6,7 +6,7 @@ stop after five minutes even if your PC is off. Stopping keeps their disks.
 
 ## Usage
 
-Requires Linux with systemd, Nix, and an AWS account on the active Free plan.
+Requires Linux with systemd, Nix, and an AWS account.
 The default template uses Ubuntu 24.04 in Frankfurt.
 
 ```sh

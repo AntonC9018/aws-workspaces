@@ -79,7 +79,7 @@ class ControllerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, \
                 patch.object(controller, "STATE", Path(directory)), \
                 patch.object(controller, "api", return_value={"workspaces": [workspace()]}), \
-                patch.object(controller, "aws_session"), patch.object(controller, "check_plan"), \
+                patch.object(controller, "aws_session"), \
                 patch.object(controller, "instance", return_value={"InstanceId": "i-owned", "State": {"Name": "running"}}), \
                 patch.object(controller, "connect") as connect, \
                 patch.object(controller.subprocess, "run", return_value=Mock(returncode=0)):
@@ -91,7 +91,7 @@ class ControllerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, \
                 patch.object(controller, "STATE", Path(directory)), \
                 patch.object(controller, "api", return_value={"workspaces": [workspace()]}), \
-                patch.object(controller, "aws_session"), patch.object(controller, "check_plan"), \
+                patch.object(controller, "aws_session"), \
                 patch.object(controller, "instance", return_value={"State": {"Name": "stopped"}}), \
                 patch.object(controller, "connect") as connect:
             controller.reconcile()
@@ -126,6 +126,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(termination[0]["Condition"],
                          {"StringEquals": {"ec2:ResourceTag/ManagedBy": "coder-workspaces"}})
         self.assertFalse(any(a.startswith("iam:") or a == "*" for a in allowed))
+        self.assertNotIn("freetier:GetAccountPlanState", allowed)
         removal = next(s for s in policy["Statement"]
                        if s["Effect"] == "Allow" and "ec2:DeleteTags" in s["Action"])
         self.assertEqual(removal["Condition"],

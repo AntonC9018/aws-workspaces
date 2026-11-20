@@ -102,7 +102,6 @@ def controller_policy(account, subnets):
                        "StringNotEquals": {"aws:RequestTag/ManagedBy": MANAGER}}},
         {"Effect": "Deny", "Action": "ec2:DeleteTags", "Resource": resources,
          "Condition": {"ForAnyValue:StringEquals": {"aws:TagKeys": "ManagedBy"}}},
-        {"Effect": "Allow", "Action": "freetier:GetAccountPlanState", "Resource": "*"},
         {"Effect": "Allow", "Action": "sts:GetCallerIdentity", "Resource": "*"},
         {"Effect": "Allow", "Action": "lambda:GetFunctionConfiguration",
          "Resource": f"arn:aws:lambda:{REGION}:{account}:function:{GUARD}"},
@@ -165,12 +164,6 @@ def configure_auth(session):
         iam.delete_access_key(UserName=user, AccessKeyId=key["AccessKeyId"])
         raise
     print("Restricted controller key saved privately; daily browser login is no longer needed for routine workspace use")
-
-
-def check_plan(session):
-    plan = session.client("freetier", region_name="us-east-1").get_account_plan_state()
-    if plan["accountPlanType"] != "FREE" or plan["accountPlanStatus"] != "ACTIVE":
-        raise RuntimeError("Expected an active AWS Free plan; no account changes were made")
 
 
 def deploy_guard(session):
@@ -634,7 +627,6 @@ def reconcile():
                 if current.get("build") == build["id"] and bridge_running(current):
                     continue
                 session = aws_session()
-                check_plan(session)
                 machine = instance(session, workspace["name"])
                 if machine["State"]["Name"] != "running":
                     # Coder can still say running after the independent stop guard.
@@ -724,7 +716,6 @@ def main():
         show_links(args.workspace)
         return
     session = aws_session(bootstrap=args.action in ("setup", "configure-auth"))
-    check_plan(session)
     if args.action == "authorize":
         authorize_repository(session, args.workspace, args.repo, write=args.write)
         return
