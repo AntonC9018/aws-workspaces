@@ -64,10 +64,23 @@ data "aws_subnets" "default" {
   }
 }
 
+data "coder_parameter" "disk_gb" {
+  name         = "disk_gb"
+  display_name = "Root disk size (GiB)"
+  description  = "Encrypted gp3 root volume size (30–100 GiB)."
+  type         = "number"
+  default      = "30"
+  mutable      = false
+  validation {
+    min = 30
+    max = 100
+  }
+}
+
 data "coder_parameter" "instance_type" {
   name         = "instance_type"
   display_name = "Machine size"
-  description  = "Choose for actual RAM needs. Only account-eligible x86 machines are listed."
+  description  = "Choose for actual RAM needs. Account-eligible x86 machines."
   default      = "t3.small"
   mutable      = false
   option {
@@ -81,6 +94,14 @@ data "coder_parameter" "instance_type" {
   option {
     name  = "Build — 2 vCPU / 8 GiB"
     value = "m7i-flex.large"
+  }
+  option {
+    name  = "Heavy build — 4 vCPU / 8 GiB"
+    value = "c7i-flex.xlarge"
+  }
+  option {
+    name  = "Heavy build / Unity — 4 vCPU / 16 GiB"
+    value = "m7i-flex.xlarge"
   }
 }
 
@@ -145,7 +166,7 @@ resource "aws_instance" "workspace" {
   }
   root_block_device {
     volume_type           = "gp3"
-    volume_size           = 30
+    volume_size           = tonumber(data.coder_parameter.disk_gb.value)
     encrypted             = true
     delete_on_termination = true
   }

@@ -55,6 +55,19 @@ data "coder_parameter" "keep_workspace" {
   mutable      = true
 }
 
+data "coder_parameter" "disk_gb" {
+  name         = "disk_gb"
+  display_name = "Boot volume size (GiB)"
+  description  = "OCI boot volume size (50–100 GiB)."
+  type         = "number"
+  default      = "50"
+  mutable      = false
+  validation {
+    min = 50
+    max = 100
+  }
+}
+
 data "coder_parameter" "instance_type" {
   name         = "instance_type"
   display_name = "Machine size"
@@ -170,7 +183,7 @@ resource "oci_core_instance" "workspace" {
   source_details {
     source_type             = "image"
     source_id               = local.is_arm ? var.arm_image_id : var.x86_image_id
-    boot_volume_size_in_gbs = 50
+    boot_volume_size_in_gbs = tonumber(data.coder_parameter.disk_gb.value)
   }
 
   create_vnic_details {

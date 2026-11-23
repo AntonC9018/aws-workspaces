@@ -11,18 +11,21 @@ Use `coder-aws` (AWS) or `coder-oci` (OCI) matching the worker's provider. If mi
 
 ## Sizes
 
-- `coder-aws` (x86_64): `t3.small` (2v/2G, default), `c7i-flex.large` (2v/4G), `m7i-flex.large` (2v/8G).
+- `coder-aws` (x86_64): `t3.small` (2v/2G, default), `c7i-flex.large` (2v/4G), `m7i-flex.large` (2v/8G),
+  `c7i-flex.xlarge` (4v/8G), `m7i-flex.xlarge` (4v/16G). `--disk-gb` 30–100 (default 30).
 - `coder-oci` (`coder-oci setup` once): `a1-2c-12g` (Always Free ARM64 2c/12G, default),
   `a1-4c-24g` (ARM64), `e5-2c-8g` / `e5-4c-16g` / `e5-8c-32g` (trial x86_64 4–16v/8–32G; needs
-  quota beyond Always Free).
+  quota beyond Always Free). `--disk-gb` 50–100 (default 50).
 
-Pick the smallest RAM-fitting size. Never expose dashboards or previews publicly.
+Pick the smallest RAM-fitting size. Never expose dashboards or previews publicly. If a task needs
+environment setup beyond syncing the repo and running its install script, suggest adding a reusable
+profile/image for that project.
 
 ## Lifecycle and cleanup
 
 ```sh
 coder-aws list --all
-coder-aws create NAME [--instance-type SIZE] [--manifest FILE] [--thread-id ID] [--keep]
+coder-aws create NAME [--instance-type SIZE] [--disk-gb N] [--manifest FILE] [--thread-id ID] [--keep]
 coder-aws run NAME [--project KEY] [--timeout 3600] [--wait] -- bash -c 'make build'
 coder-aws fetch NAME && coder-aws delete NAME
 ```

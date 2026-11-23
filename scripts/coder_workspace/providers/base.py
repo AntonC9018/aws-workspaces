@@ -58,7 +58,7 @@ class Provider:
     def setup(self, *, bootstrap: bool = False) -> None:
         raise NotImplementedError
 
-    def assert_guard(self, *, instance_type: str | None = None, check_create: bool = False) -> None:
+    def assert_guard(self, *, instance_type: str | None = None, check_create: bool = False, disk_gb: int | None = None) -> None:
         raise NotImplementedError
 
     def publish_variables(self, *, ssh_public_key: str, ssh_cidr: str,

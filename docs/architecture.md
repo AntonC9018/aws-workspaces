@@ -49,10 +49,12 @@ shutdown deadline in place.
 ## Sizes
 
 - AWS (`aws-private`, x86_64): `t3.small` (2 vCPU / 2 GiB), `c7i-flex.large` (2 vCPU / 4 GiB),
-  `m7i-flex.large` (2 vCPU / 8 GiB).
+  `m7i-flex.large` (2 vCPU / 8 GiB), `c7i-flex.xlarge` (4 vCPU / 8 GiB), `m7i-flex.xlarge`
+  (4 vCPU / 16 GiB). Root disk `--disk-gb` 30–100 GiB (default 30).
 - OCI (`oci-private`): `a1-2c-12g` (Always Free ARM64 2 OCPU / 12 GiB, default), `a1-4c-24g`
   (ARM64 4 OCPU / 24 GiB), `e5-2c-8g` (x86_64 2 OCPU / 4 vCPU / 8 GiB), `e5-4c-16g` (x86_64 4 OCPU
-  / 8 vCPU / 16 GiB), `e5-8c-32g` (x86_64 8 OCPU / 16 vCPU / 32 GiB).
+  / 8 vCPU / 16 GiB), `e5-8c-32g` (x86_64 8 OCPU / 16 vCPU / 32 GiB). Boot disk `--disk-gb`
+  50–100 GiB (default 50).
 
 The Ubuntu templates do not prove that a NixOS configuration boots and do not provide KVM.
 

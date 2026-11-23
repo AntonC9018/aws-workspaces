@@ -14,7 +14,7 @@ from .base import Instance, Provider
 
 AUTH_FILE = Path.home() / ".aws/coder-workspaces.credentials"
 AWS_GUARD_LOCKDOWN = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "aws-guard/lockdown.json"
-INSTANCE_TYPES = ("t3.small", "c7i-flex.large", "m7i-flex.large")
+INSTANCE_TYPES = ("t3.small", "c7i-flex.large", "m7i-flex.large", "c7i-flex.xlarge", "m7i-flex.xlarge")
 
 
 def _run(args, **kwargs):
@@ -252,7 +252,7 @@ class AwsProvider(Provider):
     def setup(self, *, bootstrap: bool = False) -> None:
         self.deploy_guard()
 
-    def assert_guard(self, *, instance_type: str | None = None, check_create: bool = False) -> None:
+    def assert_guard(self, *, instance_type: str | None = None, check_create: bool = False, disk_gb: int | None = None) -> None:
         if check_create and AWS_GUARD_LOCKDOWN.exists():
             raise RuntimeError(f"AWS account is in aws-guard lockdown ({AWS_GUARD_LOCKDOWN}); unlock before creating or resuming workers")
         rule = self.session.client("events").describe_rule(Name=self.guard)

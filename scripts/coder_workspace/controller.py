@@ -737,6 +737,7 @@ def build_parser(prog: str, default_provider: str, instance_types: tuple[str, ..
         if action == "create":
             command.add_argument("--manifest")
             command.add_argument("--instance-type", default=default_size, choices=list(instance_types))
+            command.add_argument("--disk-gb", type=int, default=None, help="Root disk size in GiB (AWS: 30-100, OCI: 50-100)")
             command.add_argument("--keep", action="store_true", help="Exempt from automatic stopped-workspace deletion")
         if action in ("create", "link"):
             command.add_argument("--thread-id", default=os.environ.get("T3_THREAD_ID"), required=action == "link")
@@ -856,18 +857,23 @@ def main(default_provider: str = "aws", prog: str | None = None) -> int:
 
     if args.action in ("create", "resume"):
         if args.action == "create":
-            provider.assert_guard(instance_type=args.instance_type, check_create=True)
+            provider.assert_guard(instance_type=args.instance_type, check_create=True, disk_gb=args.disk_gb)
+            min_gb = 50 if provider.name == "oci" else 30
+            disk_gb = min_gb if args.disk_gb is None else args.disk_gb
+            if not (min_gb <= disk_gb <= 100):
+                parser.error(f"--disk-gb for {provider.name} must be between {min_gb} and 100")
             command = [
                 "coder", "create", args.workspace, "--template", provider.template_name, "--yes",
                 "--automatic-updates", "always",
                 "--parameter", "instance_type=" + args.instance_type,
+                "--parameter", "disk_gb=" + str(disk_gb),
                 "--parameter", "keep_workspace=" + ("true" if args.keep else "false"),
             ]
             for key, value in origin.items():
                 command.extend(["--parameter", key + "=" + value])
             log = STATE / (args.workspace + "-build.log")
             with log.open("w") as output:
-                process = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT)
+                process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
                 try:
                     process.wait(timeout=420)
                 except subprocess.TimeoutExpired:

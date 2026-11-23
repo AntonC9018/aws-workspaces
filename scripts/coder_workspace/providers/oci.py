@@ -283,13 +283,13 @@ class OciProvider(Provider):
         ).data
         return sum(float(item.computed_amount or 0.0) for item in (result.items or []))
 
-    def _check_quota(self, infra: dict, shape_spec: dict) -> None:
+    def _check_quota(self, infra: dict, shape_spec: dict, disk_gb: int = BOOT_VOLUME_GB) -> None:
         limits = self._client("limits")
         ad = infra["availability_domain"]
         checks = [
             ("compute", shape_spec["core_limit"], shape_spec["ocpus"], "OCPUs", ad),
             ("compute", shape_spec["mem_limit"], shape_spec["memory_gb"], "GB RAM", ad),
-            ("block-storage", "total-storage-gb", BOOT_VOLUME_GB, "GB storage", ad),
+            ("block-storage", "total-storage-gb", disk_gb, "GB storage", ad),
         ]
         if shape_spec.get("regional_core_limit"):
             checks.append(("compute", shape_spec["regional_core_limit"], shape_spec["ocpus"], "regional OCPUs", None))
@@ -310,7 +310,7 @@ class OciProvider(Provider):
                     f"available {available} (effective quota {avail.effective_quota_value}).{hint}"
                 )
 
-    def assert_guard(self, *, instance_type: str | None = None, check_create: bool = False) -> None:
+    def assert_guard(self, *, instance_type: str | None = None, check_create: bool = False, disk_gb: int | None = None) -> None:
         infra = self.load_infra()
         if not instance_type:
             return
@@ -335,7 +335,7 @@ class OciProvider(Provider):
                         f"reached oci_trial_spend_limit_usd (${spend_limit_raw})."
                     )
         if check_create:
-            self._check_quota(infra, spec)
+            self._check_quota(infra, spec, disk_gb or BOOT_VOLUME_GB)
 
     def publish_variables(self, *, ssh_public_key: str, ssh_cidr: str,
                           agent_name: str, agent_email: str) -> dict[str, str]:
