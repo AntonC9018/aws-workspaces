@@ -161,13 +161,22 @@ def renew(provider: Provider, machine: Instance, seconds: int, *, preserve: bool
     provider.set_tags(machine, {"LeaseExpiresAt": deadline.isoformat(), "StoppedSince": ""})
 
 
+def known_hosts_path(instance_id: str) -> Path:
+    directory = STATE / "known_hosts.d"
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return directory / (re.sub(r"[^A-Za-z0-9_.-]", "_", instance_id) + ".hosts")
+
+
 def ssh_args(machine: Instance) -> list[str]:
     if not machine.public_ip:
         raise RuntimeError(f"Workspace {machine.name} has no public IP address yet")
+    safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", machine.id)
     return [
         "ssh", "-i", str(key_path()), "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
         "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", "-o", "ForwardAgent=no",
-        "-o", "StrictHostKeyChecking=accept-new", "-o", f"UserKnownHostsFile={STATE / 'known_hosts'}",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", f"HostKeyAlias={safe_id}",
+        "-o", f"UserKnownHostsFile={known_hosts_path(machine.id)}",
         "ubuntu@" + machine.public_ip,
     ]
 
@@ -373,17 +382,28 @@ subprocess.run(["git", "config", "--global", "credential.https://github.com.useH
 
 
 def authorize_unity(provider: Provider, name: str, *, license_path: str | None = None,
-                    create_alf: bool = False, alf_out: str | None = None) -> None:
+                    create_alf: bool = False, alf_out: str | None = None,
+                    login: bool = False, return_license: bool = False) -> None:
+    """Activate Unity on a worker via Unity CLI Personal login or Enterprise .ulf."""
     owner = api("users/me")["id"]
     machine = provider.find_instance(name, owner)
     if machine.state != "running":
         raise RuntimeError("Resume the worker before configuring Unity licensing")
     ensure_controller_ssh(provider, machine)
-    renew(provider, machine, 300)
-    remote(machine, ["sudo", "/usr/local/bin/workspace-lease", "hold", "300"])
+    lease = 600 if login else 300
+    renew(provider, machine, lease)
+    remote(machine, ["sudo", "/usr/local/bin/workspace-lease", "hold", str(lease)])
     unity_dir = STATE / "unity"
     unity_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     unity_dir.chmod(0o700)
+
+    if return_license:
+        remote(machine, ["bash", "-c",
+            "(command -v unity >/dev/null && unity license return -y || true); "
+            "rm -rf ~/.config/unity* ~/.local/share/unity* ~/.config/Unity ~/.local/share/Unity ~/.unity"])
+        print(f"{name}: returned Unity license and cleared worker Unity session")
+        return
+
     if create_alf:
         stage = remote(machine, ["mktemp", "-d", "/tmp/unity-alf-XXXXXXXX"], capture_output=True).stdout.strip()
         try:
@@ -403,17 +423,15 @@ def authorize_unity(provider: Provider, name: str, *, license_path: str | None =
         finally:
             remote(machine, ["rm", "-rf", stage, "/tmp/unity-alf.log"])
         print(f"Saved Unity activation request to {target}")
-        print("Upload it at https://license.unity3d.com/manual and save the downloaded file to:")
-        print(f"  {unity_dir / 'Unity_lic.ulf'}")
+        print("Offline .alf/.ulf activation is Enterprise/Industry only; for Personal seats run:")
+        print(f"  coder-{provider.name} authorize-unity {name} --login")
         return
-    source = Path(license_path).expanduser() if license_path else (unity_dir / "Unity_lic.ulf")
-    if not source.is_file():
-        raise RuntimeError(
-            f"Unity license file not found at {source}. "
-            f"Run authorize-unity {name} --create-alf, activate at https://license.unity3d.com/manual, "
-            f"and save Unity_lic.ulf there."
-        )
-    install = """
+
+    if license_path:
+        source = Path(license_path).expanduser()
+        if not source.is_file():
+            raise RuntimeError(f"Unity license file not found at {source}")
+        install = """
 import os, pathlib, sys
 os.umask(0o077)
 data = sys.stdin.buffer.read()
@@ -423,9 +441,82 @@ for rel in (".local/share/unity3d/Unity/Unity_lic.ulf", ".config/unity3d/Unity/U
     target.write_bytes(data)
     target.chmod(0o600)
 """
-    subprocess.run(ssh_args(machine) + [shlex.join(["python3", "-c", install])],
-                   input=source.read_bytes(), check=True)
-    print(f"{name}: delivered private Unity license from {source} (mode 0600)")
+        subprocess.run(ssh_args(machine) + [shlex.join(["python3", "-c", install])],
+                       input=source.read_bytes(), check=True)
+        print(f"{name}: delivered private Unity license from {source} (mode 0600)")
+        return
+
+    # Default Personal flow using official Unity CLI (/usr/local/bin/unity).
+    has_cli = subprocess.run(ssh_args(machine) + ["command -v unity >/dev/null"], capture_output=True)
+    if has_cli.returncode != 0:
+        raise RuntimeError(
+            f"Unity CLI not found on {name}. Bake /usr/local/bin/unity into the image "
+            "or pass --license FILE for an Enterprise .ulf."
+        )
+    bundle = unity_dir / "auth-bundle.tar"
+    if not login and bundle.is_file():
+        unpack = """
+import io, os, pathlib, sys, tarfile
+os.umask(0o077)
+home = pathlib.Path.home().resolve()
+with tarfile.open(fileobj=io.BytesIO(sys.stdin.buffer.read()), mode="r") as tf:
+    for member in tf.getmembers():
+        if not member.isfile():
+            continue
+        dest = (home / member.name).resolve()
+        if not dest.is_relative_to(home):
+            raise RuntimeError("unsafe path in Unity auth bundle")
+        dest.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        dest.write_bytes(tf.extractfile(member).read())
+        dest.chmod(0o600)
+"""
+        subprocess.run(ssh_args(machine) + [shlex.join(["python3", "-c", unpack])],
+                       input=bundle.read_bytes(), check=True)
+        status = subprocess.run(ssh_args(machine) + ["unity auth status"], capture_output=True, text=True)
+        if status.returncode != 0:
+            raise RuntimeError(
+                f"Cached Unity session was rejected on {name}; re-authenticate with:\n"
+                f"  coder-{provider.name} authorize-unity {name} --login"
+            )
+    else:
+        print(f"{name}: starting Unity CLI browser sign-in (open the printed URL on your laptop)...", flush=True)
+        subprocess.run(
+            ssh_args(machine) + ["env BROWSER=true unity auth login --insecure-storage"],
+            check=True,
+        )
+        pack = """
+import io, pathlib, sys, tarfile
+home = pathlib.Path.home()
+roots = (
+    ".config/unity-cli", ".local/share/unity-cli",
+    ".config/Unity", ".local/share/Unity",
+    ".config/unity3d", ".local/share/unity3d", ".unity",
+)
+buf = io.BytesIO()
+with tarfile.open(fileobj=buf, mode="w") as tf:
+    for rel in roots:
+        base = home / rel
+        if not base.exists():
+            continue
+        for path in sorted(base.rglob("*")):
+            if not path.is_file():
+                continue
+            sub = path.relative_to(home).as_posix()
+            if "/licenses/" in sub or "/Editor/" in sub or sub.endswith((".log", ".db", ".db-wal", ".db-shm")):
+                continue
+            tf.add(path, arcname=sub)
+sys.stdout.buffer.write(buf.getvalue())
+"""
+        packed = subprocess.run(ssh_args(machine) + [shlex.join(["python3", "-c", pack])],
+                                capture_output=True, check=True).stdout
+        if packed:
+            bundle.write_bytes(packed)
+            bundle.chmod(0o600)
+            print(f"Cached Unity CLI auth state to {bundle} (mode 0600)", flush=True)
+
+    remote(machine, ["unity", "license", "activate", "--personal", "--accept-eula"])
+    remote(machine, ["unity", "license", "status"])
+    print(f"{name}: Unity Personal license activated")
 
 
 def list_images_cmd(providers: list[Provider], *, as_json: bool = False) -> None:
@@ -519,6 +610,8 @@ def bake_image(provider: Provider, settings: dict, *, spec_path: str,
             "apt-daily.timer apt-daily-upgrade.timer || true; "
             "sudo rm -rf /etc/systemd/system/coder-workspace.service /opt/coder-agent.sh "
             "/var/lib/coder-workspace/lease.json /home/ubuntu/.config/coder-github "
+            "/home/ubuntu/.config/unity* /home/ubuntu/.local/share/unity* "
+            "/home/ubuntu/.config/Unity /home/ubuntu/.local/share/Unity /home/ubuntu/.unity "
             "/home/ubuntu/.local/state/coder-jobs /home/ubuntu/.cache/coder-transfers "
             "/home/ubuntu/projects/snapshots /tmp/coder-bake-*; "
             "sudo apt-get -o DPkg::Lock::Timeout=120 clean || true; "
@@ -683,6 +776,7 @@ def wait_for_job(provider: Provider, name: str, machine: Instance, *,
 def cleanup_local_state(name: str, *, instance_id: str | None = None, workspace_id: str | None = None) -> None:
     if instance_id:
         subprocess.run(["systemctl", "--user", "stop", bridge_unit(instance_id)], capture_output=True)
+        known_hosts_path(instance_id).unlink(missing_ok=True)
     for path in (STATE / "manifests" / (name + ".json"), STATE / (name + "-build.log")):
         path.unlink(missing_ok=True)
     if workspace_id:
@@ -924,8 +1018,10 @@ def build_parser(prog: str, default_provider: str, instance_types: tuple[str, ..
             command.add_argument("--repo", required=True)
             command.add_argument("--write", action="store_true", help="Grant repository contents write until token expiry")
         if action == "authorize-unity":
-            command.add_argument("--license", help="Local Unity_lic.ulf path (default ~/.local/state/coder-workspaces/unity/Unity_lic.ulf)")
-            command.add_argument("--create-alf", action="store_true", help="Generate a manual activation .alf file on the worker")
+            command.add_argument("--login", action="store_true", help="Sign into Unity CLI on the worker and cache auth locally")
+            command.add_argument("--return", dest="return_license", action="store_true", help="Return Unity license and clear worker Unity session")
+            command.add_argument("--license", help="Enterprise/Industry offline Unity_lic.ulf path")
+            command.add_argument("--create-alf", action="store_true", help="Generate an offline .alf request (Enterprise/Industry)")
             command.add_argument("--alf-out", help="Output path when --create-alf is set")
         if action in ("hold", "extend", "run"):
             command.add_argument("--timeout", type=int, default=300, help="Finite timeout in seconds; default 300")
@@ -1058,7 +1154,8 @@ def main(default_provider: str = "aws", prog: str | None = None) -> int:
         return 0
     if args.action == "authorize-unity":
         authorize_unity(provider, args.workspace, license_path=args.license,
-                        create_alf=args.create_alf, alf_out=args.alf_out)
+                        create_alf=args.create_alf, alf_out=args.alf_out,
+                        login=args.login, return_license=args.return_license)
         return 0
     if args.action == "upgrade":
         upgrade(provider, args.workspace)

@@ -119,6 +119,45 @@ class ImageSpecTests(unittest.TestCase):
             self.assertEqual(imgs[0]["id"], "ocid1.image.custom")
             self.assertEqual(imgs[0]["name"], "colorshoot-unity-6000")
 
+    def test_authorize_unity_uses_unity_cli_personal_flow(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            machine = Instance(id="i-1", name="dev", state="running", public_ip="1.2.3.4",
+                               instance_type="e5-2c-8g", provider="oci", tags={})
+            prov = Mock()
+            prov.name = "oci"
+            prov.find_instance.return_value = machine
+            ok = subprocess.CompletedProcess([], 0, stdout=b"tarbytes", stderr=b"")
+            with patch.object(controller, "STATE", state), \
+                 patch.object(controller, "api", return_value={"id": "owner-1"}), \
+                 patch.object(controller, "ensure_controller_ssh"), \
+                 patch.object(controller, "renew"), \
+                 patch.object(controller, "remote") as remote_mock, \
+                 patch.object(controller.subprocess, "run", return_value=ok) as run_mock:
+                controller.authorize_unity(prov, "dev", login=True)
+            self.assertTrue((state / "unity/auth-bundle.tar").is_file())
+            remote_calls = [c.args[1] for c in remote_mock.call_args_list]
+            self.assertIn(["unity", "license", "activate", "--personal", "--accept-eula"], remote_calls)
+            self.assertIn(["unity", "license", "status"], remote_calls)
+            self.assertTrue(any("unity auth login --insecure-storage" in " ".join(c.args[0])
+                                for c in run_mock.call_args_list))
+
+    def test_ssh_args_scopes_known_hosts_per_instance_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            m1 = Instance(id="ocid1.instance.one", name="a", state="running", public_ip="92.4.223.1",
+                          instance_type="e5-2c-8g", provider="oci", tags={})
+            m2 = Instance(id="ocid1.instance.two", name="b", state="running", public_ip="92.4.223.1",
+                          instance_type="e5-2c-8g", provider="oci", tags={})
+            with patch.object(controller, "STATE", state):
+                args1 = controller.ssh_args(m1)
+                args2 = controller.ssh_args(m2)
+            kh1 = [a for a in args1 if a.startswith("UserKnownHostsFile=")][0]
+            kh2 = [a for a in args2 if a.startswith("UserKnownHostsFile=")][0]
+            self.assertNotEqual(kh1, kh2)
+            self.assertIn("HostKeyAlias=ocid1.instance.one", args1)
+            self.assertIn("HostKeyAlias=ocid1.instance.two", args2)
+
 
 if __name__ == "__main__":
     unittest.main()

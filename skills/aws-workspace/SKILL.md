@@ -35,7 +35,7 @@ coder-aws fetch NAME && coder-aws delete NAME
 Same commands on `coder-oci`: `status`, `plan --manifest`, `sync --manifest`, `wait`, `logs`,
 `extend --timeout`, `hold --timeout`, `stop`, `resume`, `connect`, `keep [--off]`, `gc`, `links`,
 `images [--all]`, `bake-image --spec FILE`, `delete-image IMG`,
-`authorize-unity NAME [--create-alf]`.
+`authorize-unity NAME [--login|--return]`.
 
 - **Always `delete NAME` after fetching/verifying** unless asked to keep it (`stop` bills 30–50 GiB
   disks; stopped workers without `--keep` auto-delete after 24h).
