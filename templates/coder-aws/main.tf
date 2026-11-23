@@ -35,6 +35,13 @@ data "coder_parameter" "t3_thread_url" {
   default      = ""
   mutable      = true
 }
+data "coder_parameter" "keep_workspace" {
+  name         = "keep_workspace"
+  display_name = "Exempt from automatic stopped-workspace deletion"
+  type         = "string"
+  default      = "false"
+  mutable      = true
+}
 locals {
   workspace_url = "${var.coder_url}/@${data.coder_workspace_owner.me.name}/${data.coder_workspace.me.name}"
   origin_tags = merge({
@@ -192,12 +199,19 @@ resource "aws_instance" "workspace" {
     WorkspaceId    = data.coder_workspace.me.id
     WorkspaceName  = data.coder_workspace.me.name
     OwnerId        = data.coder_workspace_owner.me.id
+    KeepWorkspace  = data.coder_parameter.keep_workspace.value
     LeaseExpiresAt = timeadd(timestamp(), "15m")
   })
   lifecycle {
     # Explicit start/stop reconciliations refresh the startup allowance.
     # EC2 reports this false while stopped; it must not cause replacement.
-    ignore_changes  = [associate_public_ip_address, tags["SourceSnapshot"], tags["SourceProjects"]]
+    ignore_changes = [
+      associate_public_ip_address,
+      tags["SourceSnapshot"],
+      tags["SourceProjects"],
+      tags["StoppedSince"],
+      tags["KeepWorkspace"],
+    ]
   }
 }
 
