@@ -151,7 +151,7 @@ def upgrade(provider: Provider, name: str) -> None:
 
 
 def renew(provider: Provider, machine: Instance, seconds: int, *, preserve: bool = True) -> None:
-    provider.assert_guard()
+    provider.assert_guard(instance_type=machine.tags.get("InstanceSize") or None)
     deadline = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=seconds + 60)
     if preserve:
         latest = provider.get_instance(machine.id)
@@ -381,6 +381,34 @@ subprocess.run(["git", "config", "--global", "credential.https://github.com.useH
     print(f"{name}: {repo} HTTPS authorization ({'write' if write else 'read-only'}), expires {credential['expires_at']}")
 
 
+UNITY_AUTH_ROOTS = (
+    ".config/unity-cli", ".local/share/unity-cli",
+    ".config/Unity", ".local/share/Unity",
+    ".config/unity3d", ".local/share/unity3d", ".unity",
+)
+
+
+def _validate_unity_auth_bundle(raw: bytes) -> int:
+    """Ensure a Unity CLI auth tar contains only regular files under UNITY_AUTH_ROOTS."""
+    import io
+    import tarfile
+    if not raw:
+        return 0
+    count = 0
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r") as tf:
+        for member in tf.getmembers():
+            if not member.isfile():
+                raise RuntimeError(f"Unsafe non-file entry in Unity auth bundle: {member.name!r}")
+            rel = Path(member.name)
+            if rel.is_absolute() or ".." in rel.parts:
+                raise RuntimeError(f"Unsafe path in Unity auth bundle: {member.name!r}")
+            posix = rel.as_posix().removeprefix("./")
+            if not any(posix.startswith(root + "/") for root in UNITY_AUTH_ROOTS):
+                raise RuntimeError(f"Unexpected path outside Unity auth roots: {member.name!r}")
+            count += 1
+    return count
+
+
 def authorize_unity(provider: Provider, name: str, *, license_path: str | None = None,
                     create_alf: bool = False, alf_out: str | None = None,
                     login: bool = False, return_license: bool = False) -> None:
@@ -399,7 +427,8 @@ def authorize_unity(provider: Provider, name: str, *, license_path: str | None =
 
     if return_license:
         remote(machine, ["bash", "-c",
-            "(command -v unity >/dev/null && unity license return -y || true); "
+            "set -e; "
+            "if command -v unity >/dev/null; then unity license return -y; fi; "
             "rm -rf ~/.config/unity* ~/.local/share/unity* ~/.config/Unity ~/.local/share/Unity ~/.unity"])
         print(f"{name}: returned Unity license and cleared worker Unity session")
         return
@@ -407,12 +436,14 @@ def authorize_unity(provider: Provider, name: str, *, license_path: str | None =
     if create_alf:
         stage = remote(machine, ["mktemp", "-d", "/tmp/unity-alf-XXXXXXXX"], capture_output=True).stdout.strip()
         try:
+            alf_log = stage + "/unity-alf.log"
             remote(machine, ["bash", "-c",
-                f"cd {shlex.quote(stage)} && (unity-editor -batchmode -nographics -createManualActivationFile -logfile /tmp/unity-alf.log || true)"])
+                f"cd {shlex.quote(stage)} && (unity-editor -batchmode -nographics -createManualActivationFile -logfile {shlex.quote(alf_log)} || true)"])
             found = remote(machine, ["bash", "-c", f"ls -1 {shlex.quote(stage)}/*.alf 2>/dev/null | head -n 1"],
                            capture_output=True).stdout.strip()
             if not found:
-                log_tail = remote(machine, ["tail", "-n", "30", "/tmp/unity-alf.log"], capture_output=True).stdout
+                log_tail = remote(machine, ["bash", "-c", f"tail -n 30 {shlex.quote(alf_log)} 2>/dev/null || true"],
+                                  capture_output=True).stdout
                 raise RuntimeError(f"Unity did not produce a .alf file:\n{log_tail}")
             target = Path(alf_out).expanduser() if alf_out else (unity_dir / Path(found).name)
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -421,7 +452,7 @@ def authorize_unity(provider: Provider, name: str, *, license_path: str | None =
             target.write_bytes(base64.b64decode("".join(data.split())))
             target.chmod(0o600)
         finally:
-            remote(machine, ["rm", "-rf", stage, "/tmp/unity-alf.log"])
+            remote(machine, ["rm", "-rf", stage])
         print(f"Saved Unity activation request to {target}")
         print("Offline .alf/.ulf activation is Enterprise/Industry only; for Personal seats run:")
         print(f"  coder-{provider.name} authorize-unity {name} --login")
@@ -454,16 +485,24 @@ for rel in (".local/share/unity3d/Unity/Unity_lic.ulf", ".config/unity3d/Unity/U
             "or pass --license FILE for an Enterprise .ulf."
         )
     bundle = unity_dir / "auth-bundle.tar"
+    roots_literal = repr(UNITY_AUTH_ROOTS)
     if not login and bundle.is_file():
-        unpack = """
+        bundle_bytes = bundle.read_bytes()
+        if _validate_unity_auth_bundle(bundle_bytes) == 0:
+            raise RuntimeError(f"Cached Unity auth bundle at {bundle} is empty; run with --login")
+        unpack = f"""
 import io, os, pathlib, sys, tarfile
 os.umask(0o077)
 home = pathlib.Path.home().resolve()
+roots = {roots_literal}
 with tarfile.open(fileobj=io.BytesIO(sys.stdin.buffer.read()), mode="r") as tf:
     for member in tf.getmembers():
         if not member.isfile():
-            continue
-        dest = (home / member.name).resolve()
+            raise RuntimeError("unsafe non-file entry in Unity auth bundle")
+        posix = pathlib.Path(member.name).as_posix().removeprefix("./")
+        if ".." in pathlib.Path(member.name).parts or not any(posix.startswith(r + "/") for r in roots):
+            raise RuntimeError("unsafe path outside Unity auth roots")
+        dest = (home / posix).resolve()
         if not dest.is_relative_to(home):
             raise RuntimeError("unsafe path in Unity auth bundle")
         dest.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -471,7 +510,7 @@ with tarfile.open(fileobj=io.BytesIO(sys.stdin.buffer.read()), mode="r") as tf:
         dest.chmod(0o600)
 """
         subprocess.run(ssh_args(machine) + [shlex.join(["python3", "-c", unpack])],
-                       input=bundle.read_bytes(), check=True)
+                       input=bundle_bytes, check=True)
         status = subprocess.run(ssh_args(machine) + ["unity auth status"], capture_output=True, text=True)
         if status.returncode != 0:
             raise RuntimeError(
@@ -484,22 +523,18 @@ with tarfile.open(fileobj=io.BytesIO(sys.stdin.buffer.read()), mode="r") as tf:
             ssh_args(machine) + ["env BROWSER=true unity auth login --insecure-storage"],
             check=True,
         )
-        pack = """
+        pack = f"""
 import io, pathlib, sys, tarfile
 home = pathlib.Path.home()
-roots = (
-    ".config/unity-cli", ".local/share/unity-cli",
-    ".config/Unity", ".local/share/Unity",
-    ".config/unity3d", ".local/share/unity3d", ".unity",
-)
+roots = {roots_literal}
 buf = io.BytesIO()
 with tarfile.open(fileobj=buf, mode="w") as tf:
     for rel in roots:
         base = home / rel
-        if not base.exists():
+        if not base.exists() or base.is_symlink():
             continue
         for path in sorted(base.rglob("*")):
-            if not path.is_file():
+            if path.is_symlink() or not path.is_file():
                 continue
             sub = path.relative_to(home).as_posix()
             if "/licenses/" in sub or "/Editor/" in sub or sub.endswith((".log", ".db", ".db-wal", ".db-shm")):
@@ -509,9 +544,11 @@ sys.stdout.buffer.write(buf.getvalue())
 """
         packed = subprocess.run(ssh_args(machine) + [shlex.join(["python3", "-c", pack])],
                                 capture_output=True, check=True).stdout
-        if packed:
-            bundle.write_bytes(packed)
-            bundle.chmod(0o600)
+        if _validate_unity_auth_bundle(packed) > 0:
+            tmp = bundle.with_suffix(".tmp")
+            tmp.write_bytes(packed)
+            tmp.chmod(0o600)
+            os.replace(tmp, bundle)
             print(f"Cached Unity CLI auth state to {bundle} (mode 0600)", flush=True)
 
     remote(machine, ["unity", "license", "activate", "--personal", "--accept-eula"])
@@ -523,7 +560,7 @@ def list_images_cmd(providers: list[Provider], *, as_json: bool = False) -> None
     rows = []
     for prov in providers:
         try:
-            rows.extend(prov.list_images())
+            rows.extend(prov.list_images(include_pending=True))
         except Exception as error:
             print(f"warning: could not query {prov.name} images: {error}", file=sys.stderr)
     if as_json:
@@ -532,20 +569,36 @@ def list_images_cmd(providers: list[Provider], *, as_json: bool = False) -> None
     if not rows:
         print("No private baked images.")
         return
-    print(f"{'NAME':30} {'PROV':4} {'ARCH':5} {'HASH':10} {'ID'}")
+    print(f"{'NAME':30} {'PROV':4} {'ARCH':5} {'DISK':5} {'STATE':12} {'HASH':10} {'ID'}")
     for row in rows:
-        print(f"{row['name']:30} {row['provider']:4} {row['arch']:5} {row['hash'][:10]:10} {row['id']}")
+        disk = f"{row['disk_gb']}G" if row.get("disk_gb") else "-"
+        print(f"{row['name']:30} {row['provider']:4} {row['arch']:5} {disk:5} "
+              f"{row.get('state', 'available'):12} {row['hash'][:10]:10} {row['id']}")
+
+
+def _reap_process(process: subprocess.Popen) -> None:
+    process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
 
 
 def bake_image(provider: Provider, settings: dict, *, spec_path: str,
                instance_type: str | None = None, timeout: int = 2400, force: bool = False) -> dict:
+    if timeout <= 0:
+        raise ValueError("bake-image --timeout must be positive")
     min_gb = 50 if provider.name == "oci" else 30
-    spec = image_specs.load_spec(spec_path, default_disk_gb=min_gb)
+    pre = image_specs.load_spec(spec_path, default_disk_gb=min_gb)
+    raw_base = provider.base_image_id(pre["arch"]) if hasattr(provider, "base_image_id") else ""
+    base_id = raw_base if isinstance(raw_base, str) else ""
+    spec = image_specs.load_spec(spec_path, default_disk_gb=min_gb, base_image_id=base_id)
     disk_gb = max(min_gb, spec["disk_gb"])
     existing = provider.list_images()
-    same_name = [img for img in existing if img["name"] == spec["name"]]
+    same_name = [img for img in existing if img["name"] == spec["name"] and img.get("arch", spec["arch"]) == spec["arch"]]
     if not force:
-        exact = [img for img in same_name if img["hash"] == spec["hash"]]
+        exact = [img for img in same_name if img["hash"] == spec["hash"] and img.get("state", "available") == "available"]
         if exact:
             print(f"Image {spec['name']} ({spec['hash']}) already up to date: {exact[0]['id']}")
             return exact[0]
@@ -571,76 +624,87 @@ def bake_image(provider: Provider, settings: dict, *, spec_path: str,
     ]
     log = STATE / (builder + "-build.log")
     owner = api("users/me")["id"]
-    try:
-        print(f"Baking private {provider.name.upper()} image {spec['name']} ({spec['hash']}) on {builder} ({size}, {disk_gb} GiB)...", flush=True)
-        with log.open("w") as output:
-            process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
-            try:
-                process.wait(timeout=420)
-            except subprocess.TimeoutExpired:
-                process.terminate()
-                raise RuntimeError(f"Builder creation timed out; see {log}")
-        if process.returncode:
-            tail = "\n".join(log.read_text(errors="replace").splitlines()[-20:])
-            raise RuntimeError(f"Builder creation failed; see {log}\n{tail}")
-        machine = connect(provider, builder)
-        renew(provider, machine, timeout + 600)
-        remote(machine, ["sudo", "/usr/local/bin/workspace-lease", "hold", str(timeout + 600)])
-        if spec["packages"]:
-            print(f"Installing {len(spec['packages'])} apt packages...", flush=True)
-            remote(machine, ["sudo", "env", "DEBIAN_FRONTEND=noninteractive", "apt-get",
-                             "-o", "DPkg::Lock::Timeout=120", "update", "-qq"])
-            remote(machine, ["sudo", "env", "DEBIAN_FRONTEND=noninteractive", "apt-get",
-                             "-o", "DPkg::Lock::Timeout=120", "install",
-                             "-y", "--no-install-recommends", *spec["packages"]])
-        if spec["setup_script_text"]:
-            print("Running image setup_script...", flush=True)
-            remote(machine, ["sudo", "tee", "/tmp/coder-bake-setup.sh"],
-                   input=spec["setup_script_text"], stdout=subprocess.DEVNULL)
-            remote(machine, ["sudo", "chmod", "0755", "/tmp/coder-bake-setup.sh"])
-            remote(machine, ["sudo", "-E", "bash", "/tmp/coder-bake-setup.sh"])
-            remote(machine, ["sudo", "rm", "-f", "/tmp/coder-bake-setup.sh"])
-        for cmd in spec["commands"]:
-            print(f"Running image command: {cmd}", flush=True)
-            remote(machine, ["sudo", "-E", "bash", "-lc", cmd])
-        # Sanitize builder state so fresh VMs booted from this image get clean cloud-init & new agent tokens.
-        sanitize = (
-            "set -e; "
-            "sudo systemctl stop coder-workspace.service coder-lease.timer "
-            "apt-daily.timer apt-daily-upgrade.timer || true; "
-            "sudo rm -rf /etc/systemd/system/coder-workspace.service /opt/coder-agent.sh "
-            "/var/lib/coder-workspace/lease.json /home/ubuntu/.config/coder-github "
-            "/home/ubuntu/.config/unity* /home/ubuntu/.local/share/unity* "
-            "/home/ubuntu/.config/Unity /home/ubuntu/.local/share/Unity /home/ubuntu/.unity "
-            "/home/ubuntu/.local/state/coder-jobs /home/ubuntu/.cache/coder-transfers "
-            "/home/ubuntu/projects/snapshots /tmp/coder-bake-*; "
-            "sudo apt-get -o DPkg::Lock::Timeout=120 clean || true; "
-            "sudo rm -rf /var/lib/apt/lists/*; "
-            "sudo cloud-init clean --logs --machine-id; "
-            "sync"
-        )
-        remote(machine, ["bash", "-c", sanitize])
-        print("Stopping builder before snapshotting private image...", flush=True)
-        transition(builder, "stop")
-        subprocess.run(["systemctl", "--user", "stop", bridge_unit(machine.id)], capture_output=True)
-        machine = provider.find_instance(builder, owner)
-        print("Creating private cloud image (waiting for AVAILABLE)...", flush=True)
-        created = provider.create_image(machine, image_name=spec["name"], image_hash=spec["hash"], arch=spec["arch"])
-        print(f"Private {provider.name.upper()} image ready: {created['name']} -> {created['id']}", flush=True)
-        for old in same_name:
-            if old["id"] != created["id"]:
-                try:
-                    provider.delete_image(old["id"])
-                    print(f"Removed superseded image {old['id']}", flush=True)
-                except Exception as error:
-                    print(f"warning: could not remove old image {old['id']}: {error}", file=sys.stderr)
-        return created
-    finally:
-        print(f"Cleaning up temporary builder {builder}...", flush=True)
+    failed = True
+    with (STATE / (builder + ".lock")).open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
         try:
-            delete_workspace(provider, builder, force=True)
-        except Exception as error:
-            print(f"warning: builder cleanup failed for {builder}: {error}", file=sys.stderr)
+            print(f"Baking private {provider.name.upper()} image {spec['name']} ({spec['hash']}) on {builder} ({size}, {disk_gb} GiB)...", flush=True)
+            with log.open("w") as output:
+                process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
+                try:
+                    process.wait(timeout=420)
+                except subprocess.TimeoutExpired:
+                    _reap_process(process)
+                    raise RuntimeError(f"Builder creation timed out; see {log}")
+            if process.returncode:
+                tail = "\n".join(log.read_text(errors="replace").splitlines()[-20:])
+                raise RuntimeError(f"Builder creation failed; see {log}\n{tail}")
+            machine = connect(provider, builder)
+            renew(provider, machine, timeout + 600)
+            remote(machine, ["sudo", "/usr/local/bin/workspace-lease", "hold", str(timeout + 600)])
+            if spec["packages"]:
+                print(f"Installing {len(spec['packages'])} apt packages...", flush=True)
+                remote(machine, ["sudo", "env", "DEBIAN_FRONTEND=noninteractive", "apt-get",
+                                 "-o", "DPkg::Lock::Timeout=120", "update", "-qq"])
+                remote(machine, ["sudo", "env", "DEBIAN_FRONTEND=noninteractive", "apt-get",
+                                 "-o", "DPkg::Lock::Timeout=120", "install",
+                                 "-y", "--no-install-recommends", *spec["packages"]])
+            if spec["setup_script_text"]:
+                print("Running image setup_script...", flush=True)
+                remote(machine, ["sudo", "tee", "/tmp/coder-bake-setup.sh"],
+                       input=spec["setup_script_text"], stdout=subprocess.DEVNULL)
+                remote(machine, ["sudo", "chmod", "0755", "/tmp/coder-bake-setup.sh"])
+                remote(machine, ["sudo", "-E", "bash", "/tmp/coder-bake-setup.sh"])
+                remote(machine, ["sudo", "rm", "-f", "/tmp/coder-bake-setup.sh"])
+            for cmd in spec["commands"]:
+                print(f"Running image command: {cmd}", flush=True)
+                remote(machine, ["sudo", "-E", "bash", "-lc", cmd])
+            # Sanitize builder state, lease units, host keys, logs, and credentials before snapshotting.
+            sanitize = (
+                "set -e; "
+                "sudo systemctl disable --now coder-workspace.service coder-lease.timer "
+                "apt-daily.timer apt-daily-upgrade.timer || true; "
+                "sudo rm -rf /etc/systemd/system/coder-workspace.service /etc/systemd/system/coder-lease.service "
+                "/etc/systemd/system/coder-lease.timer /var/lib/cloud/scripts/per-boot/coder-lease "
+                "/opt/coder-agent.sh /var/lib/coder-workspace/lease.json /var/lib/coder-workspace/lease.lock "
+                "/home/ubuntu/.config/coder-github /home/ubuntu/.config/unity* /home/ubuntu/.local/share/unity* "
+                "/home/ubuntu/.config/Unity /home/ubuntu/.local/share/Unity /home/ubuntu/.unity "
+                "/root/.config/unity* /root/.local/share/unity* /root/.config/Unity /root/.local/share/Unity "
+                "/root/.unity /root/.cache /root/.bash_history /home/ubuntu/.bash_history "
+                "/home/ubuntu/.ssh/authorized_keys /root/.ssh/authorized_keys /etc/ssh/ssh_host_* "
+                "/home/ubuntu/.local/state/coder-jobs /home/ubuntu/.cache/coder-transfers "
+                "/home/ubuntu/projects/snapshots /tmp/coder-bake-* /tmp/unity-* /var/tmp/*; "
+                "sudo apt-get -o DPkg::Lock::Timeout=120 clean || true; "
+                "sudo rm -rf /var/lib/apt/lists/*; "
+                "sudo journalctl --rotate --vacuum-time=1s || true; "
+                "sudo truncate -s 0 /var/log/auth.log /var/log/syslog 2>/dev/null || true; "
+                "sudo cloud-init clean --logs --machine-id; "
+                "sync"
+            )
+            remote(machine, ["bash", "-c", sanitize])
+            print("Stopping builder before snapshotting private image...", flush=True)
+            transition(builder, "stop")
+            subprocess.run(["systemctl", "--user", "stop", bridge_unit(machine.id)], capture_output=True)
+            machine = provider.find_instance(builder, owner)
+            print("Creating private cloud image (waiting for AVAILABLE)...", flush=True)
+            created = provider.create_image(machine, image_name=spec["name"], image_hash=spec["hash"],
+                                            arch=spec["arch"], disk_gb=disk_gb)
+            print(f"Private {provider.name.upper()} image ready: {created['name']} -> {created['id']}", flush=True)
+            for old in same_name:
+                if old["id"] != created["id"]:
+                    try:
+                        provider.delete_image(old["id"])
+                        print(f"Removed superseded image {old['id']}", flush=True)
+                    except Exception as error:
+                        print(f"warning: could not remove old image {old['id']}: {error}", file=sys.stderr)
+            failed = False
+            return created
+        finally:
+            print(f"Cleaning up temporary builder {builder}...", flush=True)
+            try:
+                delete_workspace(provider, builder, force=True, keep_log=failed)
+            except Exception as error:
+                print(f"warning: builder cleanup failed for {builder}: {error}", file=sys.stderr)
 
 
 def project_record(name: str, machine: Instance | None = None) -> dict:
@@ -717,7 +781,17 @@ def fetch_projects(name: str, machine: Instance) -> None:
     print(f"Verified project checkouts and artifacts retrieved into {target}", flush=True)
 
 
+def _normalize_job_id(job_id: str | None) -> str | None:
+    if not job_id:
+        return None
+    cleaned = job_id.removesuffix(".service")
+    if not re.fullmatch(r"coder-job-[0-9a-f]{1,32}", cleaned):
+        raise RuntimeError(f"Invalid job ID: {job_id!r} (expected coder-job-<hex>)")
+    return cleaned
+
+
 def read_job_logs(machine: Instance, *, job_id: str | None = None, lines: int = 80) -> tuple[dict | None, str]:
+    job_id = _normalize_job_id(job_id)
     script = r'''
 import json, pathlib, sys
 job_id = sys.argv[1]
@@ -750,6 +824,7 @@ print(json.dumps({"record": record, "output": output}))
 
 def wait_for_job(provider: Provider, name: str, machine: Instance, *,
                  job_id: str | None = None, poll: int = 10, max_wait: int = 0) -> int:
+    job_id = _normalize_job_id(job_id)
     ensure_controller_ssh(provider, machine)
     start = time.monotonic()
     target_unit = (job_id + ".service") if job_id else None
@@ -773,17 +848,21 @@ def wait_for_job(provider: Provider, name: str, machine: Instance, *,
     return int(code) if isinstance(code, int) else 0
 
 
-def cleanup_local_state(name: str, *, instance_id: str | None = None, workspace_id: str | None = None) -> None:
+def cleanup_local_state(name: str, *, instance_id: str | None = None,
+                        workspace_id: str | None = None, keep_log: bool = False) -> None:
     if instance_id:
         subprocess.run(["systemctl", "--user", "stop", bridge_unit(instance_id)], capture_output=True)
         known_hosts_path(instance_id).unlink(missing_ok=True)
-    for path in (STATE / "manifests" / (name + ".json"), STATE / (name + "-build.log")):
+    paths = [STATE / "manifests" / (name + ".json")]
+    if not keep_log:
+        paths.append(STATE / (name + "-build.log"))
+    for path in paths:
         path.unlink(missing_ok=True)
     if workspace_id:
         save_bridge_records({}, remove=[workspace_id])
 
 
-def delete_workspace(provider: Provider, name: str, *, force: bool = False) -> None:
+def delete_workspace(provider: Provider, name: str, *, force: bool = False, keep_log: bool = False) -> None:
     owner = api("users/me")["id"]
     workspace = None
     try:
@@ -791,24 +870,44 @@ def delete_workspace(provider: Provider, name: str, *, force: bool = False) -> N
     except urllib.error.HTTPError as error:
         if error.code != 404:
             raise
-    machine = None
+    if workspace is not None and workspace.get("template_name") and workspace["template_name"] != provider.template_name:
+        raise RuntimeError(
+            f"Workspace {name} belongs to template {workspace['template_name']}, not {provider.template_name}; "
+            f"use the matching provider CLI"
+        )
     matches = [item for item in provider.list_instances(owner) if item.name == name]
-    if len(matches) == 1:
-        machine = matches[0]
+    if len(matches) > 1 and not force:
+        ids = ", ".join(m.id for m in matches)
+        raise RuntimeError(f"Multiple {provider.name.upper()} instances match {name} ({ids}); pass --force to proceed")
+    machine = matches[0] if len(matches) == 1 else None
     if machine and machine.state == "running" and not force:
         try:
             ensure_controller_ssh(provider, machine)
             running = active_jobs(machine)
             if running:
                 raise RuntimeError(f"Job {running[0]} is still running; wait for it or pass --force")
-        except subprocess.CalledProcessError:
-            pass
+        except subprocess.CalledProcessError as error:
+            raise RuntimeError(
+                f"Could not verify running jobs on {name} over SSH ({error}); retry or pass --force"
+            ) from error
     if workspace is not None:
         run(["coder", "delete", name, "--yes"])
-    elif machine is None:
+    elif matches:
+        if not force:
+            ids = ", ".join(m.id for m in matches)
+            raise RuntimeError(
+                f"Orphaned {provider.name.upper()} instance(s) for {name} ({ids}) have no Coder workspace; "
+                f"pass --force to terminate them directly"
+            )
+        for orphan in matches:
+            provider.terminate_instance(orphan)
+            cleanup_local_state(name, instance_id=orphan.id, keep_log=keep_log)
+        print(f"{name}: terminated orphaned {provider.name.upper()} instance(s)")
+        return
+    else:
         raise RuntimeError(f"Workspace {name} not found in Coder or {provider.name.upper()}")
     cleanup_local_state(name, instance_id=machine.id if machine else None,
-                        workspace_id=workspace["id"] if workspace else None)
+                        workspace_id=workspace["id"] if workspace else None, keep_log=keep_log)
     print(f"{name}: deleted workspace, instance, and root disk")
 
 
@@ -870,44 +969,70 @@ def gc_workspaces(providers: list[Provider], settings: dict, *,
                   owner_id: str | None = None, workspaces: list[dict] | None = None) -> dict:
     """Enforce expired leases on running workers and delete stale stopped workspaces."""
     owner = owner_id or api("users/me")["id"]
+    if older_than_hours is not None and older_than_hours < 0:
+        raise ValueError("--older-than-hours must be >= 0")
+    explicit_cutoff = older_than_hours is not None
     cutoff_hours = int(settings["delete_after_stopped_hours"]) if older_than_hours is None else older_than_hours
     ws_list = workspaces if workspaces is not None else api("workspaces?q=owner%3Ame")["workspaces"]
-    coder_by_name = {ws["name"]: ws for ws in ws_list}
+    coder_by_key = {(ws.get("template_name", ""), ws["name"]): ws for ws in ws_list}
     now = dt.datetime.now(dt.timezone.utc)
     stopped: list[str] = []
     deleted: list[str] = []
     marked: list[str] = []
+    STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
     for prov in providers:
         try:
             instances = prov.list_instances(owner)
-        except Exception:
+        except Exception as error:
+            print(f"warning: gc could not list {prov.name} instances: {error}", file=sys.stderr)
             continue
         for inst in instances:
-            if inst.state == "running":
-                deadline = inst.lease_expires_at
-                if deadline is None or deadline <= now:
-                    if not dry_run:
-                        prov.stop_instance(inst)
-                        subprocess.run(["systemctl", "--user", "stop", bridge_unit(inst.id)], capture_output=True)
-                    stopped.append(f"{prov.name}:{inst.name}")
-            elif inst.state == "stopped":
-                if inst.keep_workspace or cutoff_hours <= 0:
+            if not inst.name:
+                continue
+            lock_path = STATE / (re.sub(r"[^A-Za-z0-9_.-]", "_", inst.name) + ".lock")
+            with lock_path.open("a") as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
                     continue
-                since = inst.stopped_since
-                if since is None:
+                try:
                     if not dry_run:
-                        prov.set_tags(inst, {"StoppedSince": now.isoformat()})
-                    marked.append(f"{prov.name}:{inst.name}")
-                    continue
-                age_hours = (now - since).total_seconds() / 3600.0
-                if age_hours >= cutoff_hours and inst.name in coder_by_name:
-                    if not dry_run:
-                        run(["coder", "delete", inst.name, "--yes"])
-                        cleanup_local_state(inst.name, instance_id=inst.id,
-                                            workspace_id=coder_by_name[inst.name]["id"])
-                        notify("Auto-deleted stale workspace",
-                               f"Deleted {prov.name} workspace {inst.name} (stopped {age_hours:.1f}h >= {cutoff_hours}h)")
-                    deleted.append(f"{prov.name}:{inst.name}")
+                        fresh = prov.get_instance(inst.id)
+                        if isinstance(fresh, Instance):
+                            inst = fresh
+                    if inst.state == "running":
+                        deadline = inst.lease_expires_at
+                        if deadline is None or deadline <= now:
+                            if not dry_run:
+                                prov.stop_instance(inst)
+                                subprocess.run(["systemctl", "--user", "stop", bridge_unit(inst.id)], capture_output=True)
+                            stopped.append(f"{prov.name}:{inst.name}")
+                    elif inst.state == "stopped":
+                        if inst.keep_workspace or (not explicit_cutoff and cutoff_hours <= 0):
+                            continue
+                        since = inst.stopped_since
+                        if since is None:
+                            if not dry_run:
+                                prov.set_tags(inst, {"StoppedSince": now.isoformat()})
+                            marked.append(f"{prov.name}:{inst.name}")
+                            continue
+                        age_hours = (now - since).total_seconds() / 3600.0
+                        if age_hours >= cutoff_hours:
+                            ws = coder_by_key.get((prov.template_name, inst.name))
+                            tag_ws_id = inst.tags.get("WorkspaceId", "")
+                            if ws and (not tag_ws_id or tag_ws_id == ws["id"]):
+                                if not dry_run:
+                                    run(["coder", "delete", inst.name, "--yes"])
+                                    cleanup_local_state(inst.name, instance_id=inst.id, workspace_id=ws["id"])
+                                    notify("Auto-deleted stale workspace",
+                                           f"Deleted {prov.name} workspace {inst.name} (stopped {age_hours:.1f}h >= {cutoff_hours}h)")
+                                deleted.append(f"{prov.name}:{inst.name}")
+                            else:
+                                print(f"warning: stale orphaned {prov.name} instance {inst.name} ({inst.id}) "
+                                      f"has no matching Coder workspace; delete with coder-{prov.name} delete {inst.name} --force",
+                                      file=sys.stderr)
+                except Exception as error:
+                    print(f"warning: gc failed for {prov.name}:{inst.name} ({inst.id}): {error}", file=sys.stderr)
     return {"stopped": stopped, "marked": marked, "deleted": deleted, "dry_run": dry_run}
 
 
@@ -934,40 +1059,52 @@ def reconcile(settings: dict, providers: list[Provider] | None = None) -> None:
     by_template = {p.template_name: p for p in active_providers}
     workspaces = api("workspaces?q=owner%3Ame")["workspaces"]
     owner = api("users/me")["id"]
-    for workspace in workspaces:
-        prov = by_template.get(workspace["template_name"])
-        if not prov:
-            continue
-        previous = registry.get(workspace["id"], {})
-        build = workspace["latest_build"]
-        bridge_alive = bridge_running(previous)
-        if should_connect(workspace, previous, bridge_alive, tuple(by_template.keys())):
-            with (STATE / (workspace["name"] + ".lock")).open("a") as lock:
-                try:
-                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    continue
-                latest = json.loads(registry_path.read_text()) if registry_path.exists() else {}
-                current = latest.get(workspace["id"], {})
-                if current.get("build") == build["id"] and bridge_running(current):
-                    continue
-                machine = prov.find_instance(workspace["name"], owner)
-                if machine.state != "running":
-                    continue
-                connect(prov, workspace["name"])
-                updates[workspace["id"]] = {"build": build["id"], "instance": machine.id, "provider": prov.name}
-        elif build["status"] in ("stopped", "deleted", "failed") and previous.get("instance"):
-            subprocess.run(["systemctl", "--user", "stop", bridge_unit(previous["instance"])],
-                           capture_output=True)
-    if updates:
-        save_bridge_records(updates)
-    # Run lease-stop + stale-workspace auto-delete at most once every 5 minutes.
-    stamp = STATE / "last-gc.ts"
-    now_ts = time.time()
-    last = float(stamp.read_text()) if stamp.exists() else 0.0
-    if now_ts - last >= GC_INTERVAL_SECONDS:
-        stamp.write_text(str(now_ts))
-        gc_workspaces(active_providers, settings, owner_id=owner, workspaces=workspaces)
+    try:
+        for workspace in workspaces:
+            prov = by_template.get(workspace["template_name"])
+            if not prov or workspace["name"].startswith("bake-"):
+                continue
+            previous = registry.get(workspace["id"], {})
+            build = workspace["latest_build"]
+            bridge_alive = bridge_running(previous)
+            try:
+                if should_connect(workspace, previous, bridge_alive, tuple(by_template.keys())):
+                    with (STATE / (workspace["name"] + ".lock")).open("a") as lock:
+                        try:
+                            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        except BlockingIOError:
+                            continue
+                        latest = json.loads(registry_path.read_text()) if registry_path.exists() else {}
+                        current = latest.get(workspace["id"], {})
+                        if current.get("build") == build["id"] and bridge_running(current):
+                            continue
+                        machine = prov.find_instance(workspace["name"], owner)
+                        if machine.state != "running":
+                            continue
+                        try:
+                            prov.assert_guard(instance_type=machine.tags.get("InstanceSize") or None)
+                        except RuntimeError as guard_err:
+                            print(f"warning: stopping guarded {prov.name} workspace {workspace['name']}: {guard_err}",
+                                  file=sys.stderr)
+                            prov.stop_instance(machine)
+                            continue
+                        connect(prov, workspace["name"])
+                        updates[workspace["id"]] = {"build": build["id"], "instance": machine.id, "provider": prov.name}
+                elif build["status"] in ("stopped", "deleted", "failed") and previous.get("instance"):
+                    subprocess.run(["systemctl", "--user", "stop", bridge_unit(previous["instance"])],
+                                   capture_output=True)
+            except Exception as error:
+                print(f"warning: reconcile failed for {workspace['name']}: {error}", file=sys.stderr)
+    finally:
+        if updates:
+            save_bridge_records(updates)
+        # Always run periodic lease-stop + stale-workspace auto-delete regardless of bridge errors.
+        stamp = STATE / "last-gc.ts"
+        now_ts = time.time()
+        last = float(stamp.read_text()) if stamp.exists() else 0.0
+        if now_ts - last >= GC_INTERVAL_SECONDS:
+            gc_workspaces(active_providers, settings, owner_id=owner, workspaces=workspaces)
+            stamp.write_text(str(now_ts))
 
 
 def build_parser(prog: str, default_provider: str, instance_types: tuple[str, ...], default_size: str):
@@ -1018,10 +1155,11 @@ def build_parser(prog: str, default_provider: str, instance_types: tuple[str, ..
             command.add_argument("--repo", required=True)
             command.add_argument("--write", action="store_true", help="Grant repository contents write until token expiry")
         if action == "authorize-unity":
-            command.add_argument("--login", action="store_true", help="Sign into Unity CLI on the worker and cache auth locally")
-            command.add_argument("--return", dest="return_license", action="store_true", help="Return Unity license and clear worker Unity session")
-            command.add_argument("--license", help="Enterprise/Industry offline Unity_lic.ulf path")
-            command.add_argument("--create-alf", action="store_true", help="Generate an offline .alf request (Enterprise/Industry)")
+            mode_group = command.add_mutually_exclusive_group()
+            mode_group.add_argument("--login", action="store_true", help="Sign into Unity CLI on the worker and cache auth locally")
+            mode_group.add_argument("--return", dest="return_license", action="store_true", help="Return Unity license and clear worker Unity session")
+            mode_group.add_argument("--license", help="Enterprise/Industry offline Unity_lic.ulf path")
+            mode_group.add_argument("--create-alf", action="store_true", help="Generate an offline .alf request (Enterprise/Industry)")
             command.add_argument("--alf-out", help="Output path when --create-alf is set")
         if action in ("hold", "extend", "run"):
             command.add_argument("--timeout", type=int, default=300, help="Finite timeout in seconds; default 300")
@@ -1095,8 +1233,12 @@ def main(default_provider: str = "aws", prog: str | None = None) -> int:
         print(json.dumps(transfer_library().inventory(args.manifest), indent=2), flush=True)
     if args.action == "run" and not job_command:
         parser.error("run requires a command after --")
-    if hasattr(args, "workspace") and not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9-]{0,31}", args.workspace):
-        parser.error("workspace names must be 1–32 letters, digits or hyphens")
+    if hasattr(args, "workspace") and not re.fullmatch(r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,30}[a-zA-Z0-9])?", args.workspace):
+        parser.error("workspace names must be 1–32 letters, digits or internal hyphens")
+    if args.action == "gc" and args.older_than_hours is not None and args.older_than_hours < 0:
+        parser.error("--older-than-hours must be >= 0")
+    if args.action == "bake-image" and args.timeout <= 0:
+        parser.error("--timeout must be positive")
     origin = thread_origin(settings, args.thread_id, args.thread_url) if args.action in ("create", "link") else None
     if args.action == "create" and os.environ.get("CODEX_INTERNAL_ORIGINATOR_OVERRIDE") == "T3 Code" and not args.thread_id:
         parser.error("T3 agents must supply --thread-id from t3_thread_configure; CODEX_THREAD_ID is a different ID")
@@ -1107,30 +1249,11 @@ def main(default_provider: str = "aws", prog: str | None = None) -> int:
         reconcile(settings)
         return 0
 
-    lock = (STATE / (getattr(args, "workspace", "setup") + ".lock")).open("a")
-    fcntl.flock(lock, fcntl.LOCK_EX)
-    owner = api("users/me")["id"]
-
     provider = make_provider(args.provider, settings, bootstrap=args.action in ("setup", "configure-auth"))
-    if args.action == "links":
-        show_links(args.workspace, settings, provider.filter_hint)
-        return 0
-    if args.action == "list":
-        providers = configured_providers(settings) if args.all else [provider]
-        list_workspaces(providers, as_json=args.json)
-        return 0
-    if args.action == "gc":
-        providers = configured_providers(settings) if args.all else [provider]
-        result = gc_workspaces(providers, settings, older_than_hours=args.older_than_hours, dry_run=args.dry_run)
-        print(json.dumps(result, indent=2))
-        return 0
+    # Cloud-only or self-locking commands do not require local Coder or the global setup.lock.
     if args.action == "images":
         providers = configured_providers(settings) if args.all else [provider]
         list_images_cmd(providers, as_json=args.json)
-        return 0
-    if args.action == "bake-image":
-        bake_image(provider, settings, spec_path=args.spec, instance_type=args.instance_type,
-                   timeout=args.timeout, force=args.force)
         return 0
     if args.action == "delete-image":
         deleted = provider.delete_image(args.image)
@@ -1146,9 +1269,29 @@ def main(default_provider: str = "aws", prog: str | None = None) -> int:
             raise RuntimeError("teardown-network applies to OCI only")
         provider.teardown_network()
         return 0
+    if args.action == "list":
+        providers = configured_providers(settings) if args.all else [provider]
+        list_workspaces(providers, as_json=args.json)
+        return 0
+    if args.action == "gc":
+        providers = configured_providers(settings) if args.all else [provider]
+        result = gc_workspaces(providers, settings, older_than_hours=args.older_than_hours, dry_run=args.dry_run)
+        print(json.dumps(result, indent=2))
+        return 0
+    if args.action == "bake-image":
+        bake_image(provider, settings, spec_path=args.spec, instance_type=args.instance_type,
+                   timeout=args.timeout, force=args.force)
+        return 0
+    if args.action == "links":
+        show_links(args.workspace, settings, provider.filter_hint)
+        return 0
+
+    lock = (STATE / (getattr(args, "workspace", "setup") + ".lock")).open("a")
+    fcntl.flock(lock, fcntl.LOCK_EX)
     if args.action in ("setup", "publish-template"):
         publish(provider, settings, refresh_guard=args.action == "setup")
         return 0
+    owner = api("users/me")["id"]
     if args.action == "authorize":
         authorize_repository(provider, args.workspace, args.repo, write=args.write)
         return 0
@@ -1167,10 +1310,24 @@ def main(default_provider: str = "aws", prog: str | None = None) -> int:
     if args.action in ("create", "resume"):
         if args.action == "create":
             min_gb = 50 if provider.name == "oci" else 30
-            disk_gb = min_gb if args.disk_gb is None else args.disk_gb
+            resolved_image = ""
+            image_min_gb = min_gb
+            if args.image:
+                image_info = provider.resolve_image_info(args.image)
+                resolved_image = image_info["id"]
+                size_arch = provider.image_arch_for_size(args.instance_type)
+                if image_info.get("arch") and image_info["arch"] != size_arch:
+                    raise RuntimeError(
+                        f"Image {args.image} is {image_info['arch']}, incompatible with "
+                        f"--instance-type {args.instance_type} ({size_arch})"
+                    )
+                if image_info.get("disk_gb"):
+                    image_min_gb = max(min_gb, int(image_info["disk_gb"]))
+            disk_gb = image_min_gb if args.disk_gb is None else args.disk_gb
             if not (min_gb <= disk_gb <= 100):
                 parser.error(f"--disk-gb for {provider.name} must be between {min_gb} and 100")
-            resolved_image = provider.resolve_image(args.image) if args.image else ""
+            if disk_gb < image_min_gb:
+                parser.error(f"--disk-gb ({disk_gb}) must be at least image size ({image_min_gb} GiB)")
             provider.assert_guard(instance_type=args.instance_type, check_create=True, disk_gb=disk_gb)
             command = [
                 "coder", "create", args.workspace, "--template", provider.template_name, "--yes",
@@ -1188,7 +1345,7 @@ def main(default_provider: str = "aws", prog: str | None = None) -> int:
                 try:
                     process.wait(timeout=420)
                 except subprocess.TimeoutExpired:
-                    process.terminate()
+                    _reap_process(process)
                     raise RuntimeError(f"Coder build timed out; see {log}")
             if process.returncode:
                 tail = "\n".join(log.read_text(errors="replace").splitlines()[-20:])
@@ -1199,7 +1356,7 @@ def main(default_provider: str = "aws", prog: str | None = None) -> int:
                 sync_projects(provider, args.workspace, provider.find_instance(args.workspace, owner), args.manifest)
             return 0
         machine = provider.find_instance(args.workspace, owner)
-        provider.assert_guard(instance_type=machine.tags.get("InstanceSize") or None, check_create=True)
+        provider.assert_guard(instance_type=machine.tags.get("InstanceSize") or None, check_create=True, check_quota=False)
         if machine.state == "running":
             workspace = api("users/me/workspace/" + args.workspace)
             if workspace["latest_build"]["status"] == "failed":

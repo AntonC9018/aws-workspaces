@@ -72,7 +72,9 @@ class OciProviderTests(unittest.TestCase):
             with self.assertRaises(RuntimeError) as ctx:
                 prov.assert_guard(instance_type="e5-2c-8g", check_create=True)
             self.assertIn("standard-e5-core-count", str(ctx.exception))
-            self.assertIn("quotas.ts", str(ctx.exception))
+            self.assertIn("quota policy", str(ctx.exception))
+            # Resume skips quota double-counting (check_quota=False) while still running spend/expiry checks.
+            prov.assert_guard(instance_type="e5-2c-8g", check_create=True, check_quota=False)
 
     def test_quota_preflight_catches_zero_regional_a1_quota(self):
         limits = Mock()
@@ -85,18 +87,26 @@ class OciProviderTests(unittest.TestCase):
             with self.assertRaises(RuntimeError) as ctx:
                 prov.assert_guard(instance_type="a1-2c-12g", check_create=True)
             self.assertIn("standard-a1-core-regional-count", str(ctx.exception))
-            self.assertIn("quotas.ts", str(ctx.exception))
+            self.assertIn("quota policy", str(ctx.exception))
 
-    def test_nsg_ssh_reconciliation_updates_stale_cidr(self):
-        rule = types.SimpleNamespace(
+    def test_nsg_ssh_reconciliation_updates_stale_cidr_even_when_current_exists(self):
+        old_rule = types.SimpleNamespace(
             id="rule-old",
             protocol="6",
             source="198.51.100.1/32",
             tcp_options=types.SimpleNamespace(
                 destination_port_range=types.SimpleNamespace(min=22, max=22)),
         )
+        cur_rule = types.SimpleNamespace(
+            id="rule-cur",
+            protocol="6",
+            source="203.0.113.5/32",
+            tcp_options=types.SimpleNamespace(
+                destination_port_range=types.SimpleNamespace(min=22, max=22)),
+        )
         network = Mock()
-        network.list_network_security_group_security_rules.return_value = types.SimpleNamespace(data=[rule])
+        network.list_network_security_group_security_rules.return_value = types.SimpleNamespace(
+            data=[old_rule, cur_rule])
         with tempfile.TemporaryDirectory() as directory:
             prov = self._make_provider(directory, clients={"network": network})
             from coder_workspace.providers.base import Instance
@@ -106,8 +116,17 @@ class OciProviderTests(unittest.TestCase):
                 raw={"nsg_ids": ["ocid1.networksecuritygroup.oc1..test"]},
             )
             self.assertTrue(prov.ensure_ssh_access(machine, "203.0.113.5/32"))
-        network.add_network_security_group_security_rules.assert_called_once()
+        network.add_network_security_group_security_rules.assert_not_called()
         network.remove_network_security_group_security_rules.assert_called_once()
+
+    def test_teardown_network_refuses_external_subnet(self):
+        with tempfile.TemporaryDirectory() as directory:
+            prov = self._make_provider(
+                directory,
+                {"oci_subnet_id": "ocid1.subnet.oc1.eu-turin-1.aaaaaaaa123456"},
+            )
+            with self.assertRaises(RuntimeError):
+                prov.teardown_network()
 
 
 if __name__ == "__main__":

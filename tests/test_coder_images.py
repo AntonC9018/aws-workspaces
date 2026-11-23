@@ -120,6 +120,14 @@ class ImageSpecTests(unittest.TestCase):
             self.assertEqual(imgs[0]["name"], "colorshoot-unity-6000")
 
     def test_authorize_unity_uses_unity_cli_personal_flow(self):
+        import io
+        import tarfile
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tf:
+            info = tarfile.TarInfo(".config/unity-cli/auth.json")
+            payload = b'{"token":"ok"}'
+            info.size = len(payload)
+            tf.addfile(info, io.BytesIO(payload))
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory)
             machine = Instance(id="i-1", name="dev", state="running", public_ip="1.2.3.4",
@@ -127,7 +135,7 @@ class ImageSpecTests(unittest.TestCase):
             prov = Mock()
             prov.name = "oci"
             prov.find_instance.return_value = machine
-            ok = subprocess.CompletedProcess([], 0, stdout=b"tarbytes", stderr=b"")
+            ok = subprocess.CompletedProcess([], 0, stdout=buf.getvalue(), stderr=b"")
             with patch.object(controller, "STATE", state), \
                  patch.object(controller, "api", return_value={"id": "owner-1"}), \
                  patch.object(controller, "ensure_controller_ssh"), \
@@ -141,6 +149,33 @@ class ImageSpecTests(unittest.TestCase):
             self.assertIn(["unity", "license", "status"], remote_calls)
             self.assertTrue(any("unity auth login --insecure-storage" in " ".join(c.args[0])
                                 for c in run_mock.call_args_list))
+
+    def test_unity_auth_bundle_rejects_paths_outside_unity_roots_and_empty_tar(self):
+        import io
+        import tarfile
+        empty_buf = io.BytesIO()
+        with tarfile.open(fileobj=empty_buf, mode="w"):
+            pass
+        self.assertEqual(controller._validate_unity_auth_bundle(empty_buf.getvalue()), 0)
+
+        poison_buf = io.BytesIO()
+        with tarfile.open(fileobj=poison_buf, mode="w") as tf:
+            info = tarfile.TarInfo(".ssh/authorized_keys")
+            payload = b"ssh-ed25519 AAAA evil\n"
+            info.size = len(payload)
+            tf.addfile(info, io.BytesIO(payload))
+        with self.assertRaises(RuntimeError):
+            controller._validate_unity_auth_bundle(poison_buf.getvalue())
+
+    def test_load_spec_rejects_symlink_setup_script_inside_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "real.sh").write_text("#!/bin/sh\ntrue\n")
+            (root / "link.sh").symlink_to(root / "real.sh")
+            spec = root / "demo.json"
+            spec.write_text(json.dumps({"version": 1, "setup_script": "link.sh"}))
+            with self.assertRaises(ValueError):
+                images.load_spec(spec)
 
     def test_ssh_args_scopes_known_hosts_per_instance_id(self):
         with tempfile.TemporaryDirectory() as directory:

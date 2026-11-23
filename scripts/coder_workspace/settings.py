@@ -41,8 +41,8 @@ def load(path=None):
     settings = DEFAULTS | supplied
     if settings["region"] != DEFAULTS["region"] and "ami_id" not in supplied:
         raise ValueError("Set ami_id when selecting a different AWS region")
-    if settings["oci_region"] != DEFAULTS["oci_region"] and not ({"oci_x86_image_id", "oci_arm_image_id"} & set(supplied)):
-        raise ValueError("Set oci_x86_image_id or oci_arm_image_id when selecting a different OCI region")
+    if settings["oci_region"] != DEFAULTS["oci_region"] and not ({"oci_x86_image_id", "oci_arm_image_id"} <= set(supplied)):
+        raise ValueError("Set both oci_x86_image_id and oci_arm_image_id when selecting a different OCI region")
     if not re.fullmatch(r"[1-9][0-9]{0,5}h", settings["session_duration"]) or int(settings["session_duration"][:-1]) > 876000:
         raise ValueError("session_duration must be 1–876000 hours, for example 24h")
     for key in ("managed_by", "guard_name", "iam_user", "oci_compartment_name"):

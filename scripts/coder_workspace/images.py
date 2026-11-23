@@ -47,7 +47,7 @@ def infer_project_name(spec_path: Path) -> str:
     return _slug(candidate)
 
 
-def load_spec(path: str | Path, *, default_disk_gb: int = 50) -> dict:
+def load_spec(path: str | Path, *, default_disk_gb: int = 50, base_image_id: str = "") -> dict:
     """Load, validate, auto-scope, and hash an image specification file."""
     spec_path = Path(path).resolve()
     raw = json.loads(spec_path.read_text())
@@ -86,10 +86,15 @@ def load_spec(path: str | Path, *, default_disk_gb: int = 50) -> dict:
     if script_rel:
         if not isinstance(script_rel, str) or Path(script_rel).is_absolute():
             raise ValueError("setup_script must be a relative path")
+        # Check every path component before resolve() so symlinks inside the tree are rejected too.
+        probe = spec_path.parent
+        for part in Path(script_rel).parts:
+            probe = probe / part
+            if probe.is_symlink():
+                raise ValueError(f"setup_script must not traverse or be a symlink: {script_rel}")
         script_path = (spec_path.parent / script_rel).resolve()
-        # Allow script in spec directory or repo root parent, disallow symlinks escaping parent tree.
         base_root = spec_path.parent.parent if spec_path.parent.name in SPEC_DIRS else spec_path.parent
-        if not script_path.is_file() or script_path.is_symlink() or not script_path.is_relative_to(base_root.resolve()):
+        if not script_path.is_file() or not script_path.is_relative_to(base_root.resolve()):
             raise ValueError(f"setup_script must be a regular file inside {base_root}: {script_rel}")
         script_text = script_path.read_text()
 
@@ -104,6 +109,7 @@ def load_spec(path: str | Path, *, default_disk_gb: int = 50) -> dict:
         "packages": packages,
         "commands": commands,
         "setup_script_sha256": hashlib.sha256(script_text.encode()).hexdigest() if script_text else "",
+        **({"base_image_id": base_image_id} if base_image_id else {}),
     }
     image_hash = hashlib.sha256(json.dumps(canonical, sort_keys=True).encode()).hexdigest()[:16]
     return {

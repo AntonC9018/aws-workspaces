@@ -38,9 +38,10 @@ data "coder_parameter" "t3_thread_url" {
 data "coder_parameter" "keep_workspace" {
   name         = "keep_workspace"
   display_name = "Exempt from automatic stopped-workspace deletion"
+  description  = "Set at creation; toggle later with coder-aws keep [--off] NAME."
   type         = "string"
   default      = "false"
-  mutable      = true
+  mutable      = false
 }
 locals {
   workspace_url = "${var.coder_url}/@${data.coder_workspace_owner.me.name}/${data.coder_workspace.me.name}"
@@ -138,6 +139,9 @@ resource "aws_security_group" "workspace" {
     cidr_blocks = ["0.0.0.0/0"]
   }
   tags = merge(local.origin_tags, { ManagedBy = var.managed_by })
+  lifecycle {
+    ignore_changes = [ingress]
+  }
 }
 
 resource "coder_agent" "dev" {

@@ -1,10 +1,11 @@
 # Lifecycle and limits
 
 Coder stores Terraform state in local PostgreSQL. On AWS, the `aws-private` template creates an EC2
-instance, an encrypted 30 GiB gp3 root disk (`DeleteOnTermination=true`), a security group, and an
-SSH key pair. On Oracle Cloud, the `oci-private` template creates a compute instance inside the
-`coder-workspaces` compartment, a 50 GiB boot volume (`preserve_boot_volume = false`), and a
-per-workspace NSG attached to the shared subnet.
+instance, an encrypted 30–100 GiB gp3 root disk (`DeleteOnTermination=true`, default 30 GiB), a
+security group, and an SSH key pair. On Oracle Cloud, the `oci-private` template creates a compute
+instance inside the `coder-workspaces` compartment, a 50–100 GiB boot volume
+(`preserve_boot_volume = false`, default 50 GiB), and a per-workspace NSG attached to the shared
+subnet.
 
 Guest shutdown stops the instance and retains its disk. Explicit workspace deletion
 (`coder-aws delete NAME`, `coder-oci delete NAME`, or dashboard Delete) permanently terminates the
@@ -38,11 +39,13 @@ shutdown deadline in place.
   2. cumulative monthly Usage API cost against `oci_trial_spend_limit_usd` (default `$250`), and
   3. effective OCI tenancy quotas via the Limits API.
   Always Free `a1-2c-12g` remains allowed as long as Always Free quota is available.
-- **Automatic stale-workspace deletion:** stopped disks still consume credits. Both `reconcile`
-  (periodic) and `gc` tag stopped instances with `StoppedSince` and delete them cleanly via
-  `coder delete NAME --yes` once they stay stopped longer than `delete_after_stopped_hours`
-  (default `24`, set `"0"` to disable), unless the workspace is marked with `--keep` or
-  `keep NAME` (`KeepWorkspace=true`).
+- **Automatic stale-workspace deletion:** stopped disks still consume credits. While the laptop's
+  `coder-reconcile.timer` is running, `reconcile` (and manual `gc`) tag stopped instances with
+  `StoppedSince` and delete them cleanly via `coder delete NAME --yes` once they stay stopped longer
+  than `delete_after_stopped_hours` (default `24`, set `"0"` to disable), unless the workspace is
+  marked with `--keep` or `keep NAME` (`KeepWorkspace=true`). Note that OCI lease enforcement and
+  stale deletion run from the controller while `coder-trial` is running (guests still self-poweroff
+  when offline via the guest lease timer).
 - **Automatic SSH firewall update:** if the laptop's public IPv4 address changes, `connect` and
   remote operations update the workspace's AWS security group or OCI NSG TCP/22 rule automatically.
 

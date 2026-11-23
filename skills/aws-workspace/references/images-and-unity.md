@@ -15,8 +15,9 @@ coder-oci delete-image PROJECT-NAME
 
 Same on `coder-aws` (`amd64` only). Specs take `version: 1`, optional `name` (auto-scoped
 `<project>-<name>`, multiple images per project), `arch` (`amd64`/`arm64`), `disk_gb`, `packages`,
-`setup_script`, and `commands`. Never bake source checkouts or credentials. `bake-image` skips
-matching hashes and deletes superseded images automatically.
+`setup_script`, and `commands`. Never bake source checkouts or credentials. `create --image`
+requires matching architecture and `--disk-gb` >= image `disk_gb` (auto-defaults to image size if
+omitted). `bake-image` skips matching hashes and deletes superseded images automatically.
 
 ## Unity Personal activation
 

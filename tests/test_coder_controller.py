@@ -19,8 +19,8 @@ def workspace(status="running", build="build-1", template="aws-private", name="s
             "latest_build": {"id": build, "status": status}}
 
 
-def inst(name="smoke", state="running", provider="aws", tags=None, public_ip="1.2.3.4", raw=None):
-    return Instance(id="i-owned", name=name, state=state, public_ip=public_ip,
+def inst(name="smoke", state="running", provider="aws", tags=None, public_ip="1.2.3.4", raw=None, id="i-owned"):
+    return Instance(id=id, name=name, state=state, public_ip=public_ip,
                     instance_type="t3.small", provider=provider, tags=dict(tags or {}), raw=raw or {})
 
 
@@ -80,7 +80,8 @@ class ControllerTests(unittest.TestCase):
         self.assertFalse(controller.should_connect(workspace(template="other"), {}))
 
     def test_repeated_reconciliation_does_not_renew_idle_lease(self):
-        prov = Mock(name="aws")
+        from coder_workspace.providers import Provider
+        prov = Mock(spec=Provider)
         prov.name = "aws"
         prov.template_name = "aws-private"
         prov.find_instance.return_value = inst(state="running")
@@ -197,13 +198,17 @@ class ControllerTests(unittest.TestCase):
     def test_gc_stops_expired_marks_stopped_and_deletes_stale_non_kept_workspaces(self):
         now = dt.datetime.now(dt.timezone.utc)
         old_stop = (now - dt.timedelta(hours=30)).isoformat()
-        expired_running = inst(name="run-exp", state="running", tags={"LeaseExpiresAt": "2020-01-01T00:00:00+00:00"})
-        fresh_stopped = inst(name="stop-new", state="stopped", tags={})
-        stale_stopped = inst(name="stop-old", state="stopped", tags={"StoppedSince": old_stop})
-        kept_stopped = inst(name="stop-keep", state="stopped", tags={"StoppedSince": old_stop, "KeepWorkspace": "true"})
+        expired_running = inst(id="i-1", name="run-exp", state="running", tags={"LeaseExpiresAt": "2020-01-01T00:00:00+00:00"})
+        fresh_stopped = inst(id="i-2", name="stop-new", state="stopped", tags={})
+        stale_stopped = inst(id="i-3", name="stop-old", state="stopped", tags={"StoppedSince": old_stop})
+        kept_stopped = inst(id="i-4", name="stop-keep", state="stopped", tags={"StoppedSince": old_stop, "KeepWorkspace": "true"})
         prov = Mock()
         prov.name = "oci"
+        prov.template_name = "oci-private"
         prov.list_instances.return_value = [expired_running, fresh_stopped, stale_stopped, kept_stopped]
+        prov.get_instance.side_effect = lambda iid: next(
+            i for i in [expired_running, fresh_stopped, stale_stopped, kept_stopped] if i.id == iid
+        )
         ws_list = {"workspaces": [
             workspace(name="stop-old", template="oci-private"),
             workspace(name="stop-keep", template="oci-private"),
@@ -223,6 +228,42 @@ class ControllerTests(unittest.TestCase):
         run_mock.assert_called_once_with(["coder", "delete", "stop-old", "--yes"])
         notify_mock.assert_called_once()
 
+    def test_gc_does_not_delete_other_provider_workspace_on_name_collision(self):
+        old_stop = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=30)).isoformat()
+        aws_orphan = inst(name="dev", state="stopped", tags={"StoppedSince": old_stop})
+        prov = Mock()
+        prov.name = "aws"
+        prov.template_name = "aws-private"
+        prov.list_instances.return_value = [aws_orphan]
+        prov.get_instance.return_value = aws_orphan
+        ws_list = {"workspaces": [workspace(name="dev", template="oci-private")]}
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(controller, "STATE", Path(directory)), \
+                patch.object(controller, "api", side_effect=[{"id": "owner-1"}, ws_list]), \
+                patch.object(controller, "run") as run_mock:
+            result = controller.gc_workspaces([prov], self.settings)
+        self.assertEqual(result["deleted"], [])
+        run_mock.assert_not_called()
+
+    def test_reconcile_skips_bake_builders_and_runs_gc_despite_connect_error(self):
+        from coder_workspace.providers import Provider
+        prov = Mock(spec=Provider)
+        prov.name = "oci"
+        prov.template_name = "oci-private"
+        prov.find_instance.side_effect = RuntimeError("missing instance")
+        prov.list_instances.return_value = []
+        ws_list = {"workspaces": [
+            workspace(name="bake-deadbeef-1234", template="oci-private"),
+            workspace(name="broken-ws", template="oci-private"),
+        ]}
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(controller, "STATE", Path(directory)), \
+                patch.object(controller, "api", side_effect=[ws_list, {"id": "owner-1"}]), \
+                patch.object(controller, "gc_workspaces") as gc_mock:
+            controller.reconcile(self.settings, providers=[prov])
+        prov.find_instance.assert_called_once_with("broken-ws", "owner-1")
+        gc_mock.assert_called_once()
+
     def test_wait_for_job_returns_exit_code_when_job_completes(self):
         prov = Mock()
         machine = inst(state="running")
@@ -230,7 +271,7 @@ class ControllerTests(unittest.TestCase):
                 patch.object(controller, "active_jobs", side_effect=[["coder-job-1.service"], []]), \
                 patch.object(controller, "read_job_logs", return_value=({"job": "coder-job-1", "exit_status": 0}, "ok\n")), \
                 patch.object(controller.time, "sleep"):
-            code = controller.wait_for_job(prov, "smoke", machine, job_id="coder-job-1", poll=1)
+            code = controller.wait_for_job(prov, "smoke", machine, job_id="coder-job-1.service", poll=1)
         self.assertEqual(code, 0)
 
 

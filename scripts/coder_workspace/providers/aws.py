@@ -6,15 +6,25 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
+import sys
 import time
 import zipfile
 
 from .base import Instance, Provider
 
 AUTH_FILE = Path.home() / ".aws/coder-workspaces.credentials"
-AWS_GUARD_LOCKDOWN = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "aws-guard/lockdown.json"
+AWS_GUARD_LOCKDOWN: Path | None = None
 INSTANCE_TYPES = ("t3.small", "c7i-flex.large", "m7i-flex.large", "c7i-flex.xlarge", "m7i-flex.xlarge")
+AMI_ID_RE = re.compile(r"^ami-[0-9a-f]+$")
+
+
+def lockdown_path() -> Path:
+    if AWS_GUARD_LOCKDOWN is not None:
+        return AWS_GUARD_LOCKDOWN
+    state_root = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local/state")
+    return Path(state_root) / "aws-guard/lockdown.json"
 
 
 def _run(args, **kwargs):
@@ -265,9 +275,11 @@ class AwsProvider(Provider):
     def setup(self, *, bootstrap: bool = False) -> None:
         self.deploy_guard()
 
-    def assert_guard(self, *, instance_type: str | None = None, check_create: bool = False, disk_gb: int | None = None) -> None:
-        if check_create and AWS_GUARD_LOCKDOWN.exists():
-            raise RuntimeError(f"AWS account is in aws-guard lockdown ({AWS_GUARD_LOCKDOWN}); unlock before creating or resuming workers")
+    def assert_guard(self, *, instance_type: str | None = None, check_create: bool = False,
+                     check_quota: bool = True, disk_gb: int | None = None) -> None:
+        lockdown = lockdown_path()
+        if lockdown.exists():
+            raise RuntimeError(f"AWS account is in aws-guard lockdown ({lockdown}); unlock before running or renewing workers")
         rule = self.session.client("events").describe_rule(Name=self.guard)
         targets = self.session.client("events").list_targets_by_rule(Rule=self.guard)["Targets"]
         function = self.session.client("lambda").get_function_configuration(FunctionName=self.guard)
@@ -296,8 +308,12 @@ class AwsProvider(Provider):
         ]
         if owner_id:
             filters.append({"Name": "tag:OwnerId", "Values": [owner_id]})
-        found = self.session.client("ec2").describe_instances(Filters=filters)
-        return [_to_instance(item) for res in found["Reservations"] for item in res["Instances"]]
+        ec2 = self.session.client("ec2")
+        if hasattr(ec2, "get_paginator"):
+            pages = ec2.get_paginator("describe_instances").paginate(Filters=filters)
+        else:
+            pages = [ec2.describe_instances(Filters=filters)]
+        return [_to_instance(item) for page in pages for res in page.get("Reservations", []) for item in res.get("Instances", [])]
 
     def get_instance(self, instance_id: str) -> Instance:
         found = self.session.client("ec2").describe_instances(InstanceIds=[instance_id])
@@ -309,7 +325,7 @@ class AwsProvider(Provider):
         machine.tags.update(tags)
 
     def ensure_ssh_access(self, machine: Instance, ssh_cidr: str) -> bool:
-        """Update the owned security group's TCP/22 rule if the controller's IPv4 changed."""
+        """Update the owned security group's TCP/22 rule if the controller's IPv4 changed or stale rules exist."""
         groups = [g["GroupId"] for g in machine.raw.get("SecurityGroups", []) if g.get("GroupId")]
         if not groups:
             return False
@@ -325,14 +341,15 @@ class AwsProvider(Provider):
         for rule in sg.get("IpPermissions", []):
             if rule.get("IpProtocol") == "tcp" and rule.get("FromPort") == 22 and rule.get("ToPort") == 22:
                 current_cidrs.extend(r["CidrIp"] for r in rule.get("IpRanges", []) if r.get("CidrIp"))
-        if ssh_cidr in current_cidrs:
-            return False
-        ec2.authorize_security_group_ingress(
-            GroupId=sg_id,
-            IpPermissions=[{"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22,
-                            "IpRanges": [{"CidrIp": ssh_cidr, "Description": "SSH from the controller only"}]}],
-        )
         stale = [c for c in current_cidrs if c != ssh_cidr]
+        if ssh_cidr in current_cidrs and not stale:
+            return False
+        if ssh_cidr not in current_cidrs:
+            ec2.authorize_security_group_ingress(
+                GroupId=sg_id,
+                IpPermissions=[{"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22,
+                                "IpRanges": [{"CidrIp": ssh_cidr, "Description": "SSH from the controller only"}]}],
+            )
         if stale:
             ec2.revoke_security_group_ingress(
                 GroupId=sg_id,
@@ -344,6 +361,9 @@ class AwsProvider(Provider):
     def stop_instance(self, machine: Instance) -> None:
         self.session.client("ec2").stop_instances(InstanceIds=[machine.id])
 
+    def terminate_instance(self, machine: Instance) -> None:
+        self.session.client("ec2").terminate_instances(InstanceIds=[machine.id])
+
     def read_userdata(self, machine: Instance) -> bytes:
         encoded = self.session.client("ec2").describe_instance_attribute(
             InstanceId=machine.id, Attribute="userData")["UserData"]["Value"]
@@ -354,7 +374,10 @@ class AwsProvider(Provider):
             raise RuntimeError("AWS template supports amd64 images only (use coder-oci for arm64)")
         return "m7i-flex.xlarge"
 
-    def list_images(self) -> list[dict]:
+    def base_image_id(self, arch: str) -> str:
+        return self.settings["ami_id"]
+
+    def list_images(self, *, include_pending: bool = False) -> list[dict]:
         ec2 = self.session.client("ec2")
         found = ec2.describe_images(
             Owners=["self"],
@@ -362,37 +385,49 @@ class AwsProvider(Provider):
         )["Images"]
         results = []
         for img in found:
+            state = img.get("State", "")
+            if not include_pending and state != "available":
+                continue
             tags = {t["Key"]: t["Value"] for t in img.get("Tags", [])}
             snaps = [b["Ebs"]["SnapshotId"] for b in img.get("BlockDeviceMappings", [])
                      if b.get("Ebs", {}).get("SnapshotId")]
+            vol_sizes = [b["Ebs"]["VolumeSize"] for b in img.get("BlockDeviceMappings", [])
+                         if b.get("Ebs", {}).get("VolumeSize")]
+            disk_gb = int(tags["ImageDiskGb"]) if tags.get("ImageDiskGb", "").isdigit() else (vol_sizes[0] if vol_sizes else None)
             results.append({
                 "id": img["ImageId"],
                 "name": tags.get("ImageName", img.get("Name", "")),
                 "hash": tags.get("ImageHash", ""),
                 "arch": tags.get("ImageArch", "amd64"),
-                "state": img.get("State", ""),
+                "disk_gb": disk_gb,
+                "state": state,
                 "created": img.get("CreationDate", ""),
                 "provider": "aws",
                 "snapshots": snaps,
             })
         return sorted(results, key=lambda r: r["created"], reverse=True)
 
-    def resolve_image(self, ref: str) -> str:
+    def resolve_image_info(self, ref: str) -> dict:
         if ref.startswith("ami-"):
-            return ref
-        matches = [img for img in self.list_images() if img["name"] == ref and img["state"] == "available"]
+            if not AMI_ID_RE.fullmatch(ref):
+                raise RuntimeError(f"Invalid AWS AMI ID: {ref}")
+            owned = [img for img in self.list_images() if img["id"] == ref]
+            return owned[0] if owned else {"id": ref, "name": ref, "arch": "amd64", "disk_gb": None, "provider": "aws"}
+        matches = [img for img in self.list_images() if img["name"] == ref]
         if not matches:
             raise RuntimeError(f"Private AWS image not found: {ref} (run coder-aws images)")
-        return matches[0]["id"]
+        return matches[0]
 
-    def create_image(self, machine: Instance, *, image_name: str, image_hash: str, arch: str) -> dict:
+    def create_image(self, machine: Instance, *, image_name: str, image_hash: str,
+                     arch: str, disk_gb: int = 30) -> dict:
         ec2 = self.session.client("ec2")
-        ami_name = f"coder-{image_name}-{image_hash[:8]}"
+        ami_name = f"coder-{image_name}-{image_hash[:8]}-{int(time.time())}"
         tags = [
             {"Key": "ManagedBy", "Value": self.manager},
             {"Key": "ImageName", "Value": image_name},
             {"Key": "ImageHash", "Value": image_hash},
             {"Key": "ImageArch", "Value": arch},
+            {"Key": "ImageDiskGb", "Value": str(disk_gb)},
         ]
         response = ec2.create_image(
             InstanceId=machine.id,
@@ -406,15 +441,23 @@ class AwsProvider(Provider):
         image_id = response["ImageId"]
         waiter = ec2.get_waiter("image_available")
         waiter.wait(ImageIds=[image_id], WaiterConfig={"Delay": 15, "MaxAttempts": 100})
-        return {"id": image_id, "name": image_name, "hash": image_hash, "arch": arch, "provider": "aws"}
+        return {"id": image_id, "name": image_name, "hash": image_hash, "arch": arch,
+                "disk_gb": disk_gb, "provider": "aws"}
 
     def delete_image(self, ref: str) -> dict:
         ec2 = self.session.client("ec2")
-        matches = [img for img in self.list_images() if img["id"] == ref or img["name"] == ref]
+        matches = [img for img in self.list_images(include_pending=True) if img["id"] == ref or img["name"] == ref]
         if not matches:
             raise RuntimeError(f"Owned AWS image not found: {ref}")
         target = matches[0]
         ec2.deregister_image(ImageId=target["id"])
+        failed_snaps = []
         for snap in target.get("snapshots", []):
-            ec2.delete_snapshot(SnapshotId=snap)
+            try:
+                ec2.delete_snapshot(SnapshotId=snap)
+            except Exception as error:
+                failed_snaps.append(f"{snap} ({error})")
+        if failed_snaps:
+            print(f"warning: deregistered {target['id']} but failed to delete snapshots: {', '.join(failed_snaps)}",
+                  file=sys.stderr)
         return target

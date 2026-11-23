@@ -50,9 +50,10 @@ data "coder_parameter" "t3_thread_url" {
 data "coder_parameter" "keep_workspace" {
   name         = "keep_workspace"
   display_name = "Exempt from automatic stopped-workspace deletion"
+  description  = "Set at creation; toggle later with coder-oci keep [--off] NAME."
   type         = "string"
   default      = "false"
-  mutable      = true
+  mutable      = false
 }
 
 data "coder_parameter" "disk_gb" {
@@ -145,6 +146,9 @@ resource "oci_core_network_security_group_security_rule" "ssh" {
       max = 22
     }
   }
+  lifecycle {
+    ignore_changes = [source]
+  }
 }
 
 resource "oci_core_network_security_group_security_rule" "egress" {
@@ -198,7 +202,6 @@ resource "oci_core_instance" "workspace" {
   create_vnic_details {
     subnet_id        = var.subnet_id
     assign_public_ip = "true"
-    hostname_label   = "coder-${data.coder_workspace.me.name}"
     nsg_ids          = [oci_core_network_security_group.workspace.id]
   }
 
@@ -243,14 +246,15 @@ resource "oci_core_instance" "workspace" {
     })}")
   }
 
-  # OCI enforces a 10-tag limit on freeform_tags. Keep at most 7 static tags here
-  # so dynamic controller tags (SourceSnapshot, StoppedSince) stay within budget.
+  # OCI enforces a 10-tag limit on freeform_tags. Keep at most 8 static tags here
+  # so dynamic controller tags (SourceSnapshot, StoppedSince) stay within budget (<= 10).
   freeform_tags = merge(
     data.coder_parameter.t3_thread_id.value == "" ? {} : {
       T3ThreadId = data.coder_parameter.t3_thread_id.value
     },
     {
       ManagedBy      = var.managed_by
+      WorkspaceId    = data.coder_workspace.me.id
       WorkspaceName  = data.coder_workspace.me.name
       OwnerId        = data.coder_workspace_owner.me.id
       InstanceSize   = data.coder_parameter.instance_type.value
@@ -262,7 +266,6 @@ resource "oci_core_instance" "workspace" {
   lifecycle {
     ignore_changes = [
       metadata["user_data"],
-      freeform_tags["LeaseExpiresAt"],
       freeform_tags["SourceSnapshot"],
       freeform_tags["StoppedSince"],
       freeform_tags["KeepWorkspace"],

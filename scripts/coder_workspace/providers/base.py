@@ -58,7 +58,8 @@ class Provider:
     def setup(self, *, bootstrap: bool = False) -> None:
         raise NotImplementedError
 
-    def assert_guard(self, *, instance_type: str | None = None, check_create: bool = False, disk_gb: int | None = None) -> None:
+    def assert_guard(self, *, instance_type: str | None = None, check_create: bool = False,
+                     check_quota: bool = True, disk_gb: int | None = None) -> None:
         raise NotImplementedError
 
     def publish_variables(self, *, ssh_public_key: str, ssh_cidr: str,
@@ -87,19 +88,32 @@ class Provider:
     def stop_instance(self, machine: Instance) -> None:
         raise NotImplementedError
 
+    def terminate_instance(self, machine: Instance) -> None:
+        raise NotImplementedError
+
     def read_userdata(self, machine: Instance) -> bytes:
         raise NotImplementedError
 
     def default_builder_type(self, arch: str) -> str:
         raise NotImplementedError
 
-    def list_images(self) -> list[dict]:
+    def base_image_id(self, arch: str) -> str:
+        raise NotImplementedError
+
+    def image_arch_for_size(self, instance_type: str) -> str:
+        return "amd64"
+
+    def list_images(self, *, include_pending: bool = False) -> list[dict]:
         raise NotImplementedError
 
     def resolve_image(self, ref: str) -> str:
+        return self.resolve_image_info(ref)["id"]
+
+    def resolve_image_info(self, ref: str) -> dict:
         raise NotImplementedError
 
-    def create_image(self, machine: Instance, *, image_name: str, image_hash: str, arch: str) -> dict:
+    def create_image(self, machine: Instance, *, image_name: str, image_hash: str,
+                     arch: str, disk_gb: int = 50) -> dict:
         raise NotImplementedError
 
     def delete_image(self, ref: str) -> dict:

@@ -1,6 +1,6 @@
 # Setup
 
-The Nix flake supplies `coder-trial` and `coder-aws`. `nix develop` supplies test
+The Nix flake supplies `coder-trial`, `coder-aws`, and `coder-oci`. `nix develop` supplies test
 and development tools. Run the commands from the checkout, or install those
 packages with Home Manager.
 
