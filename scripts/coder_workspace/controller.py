@@ -22,6 +22,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
+from coder_workspace import images as image_specs
 from coder_workspace.providers import AwsProvider, Instance, OciProvider, Provider
 from coder_workspace.settings import load as load_settings
 
@@ -237,13 +238,13 @@ def connect(provider: Provider, name: str) -> Instance:
         ssh_args(machine)[:-1] + ["-NT", "-o", "ExitOnForwardFailure=yes", "-R",
                                   "127.0.0.1:7080:127.0.0.1:7080", ssh_args(machine)[-1]])
     deadline = time.monotonic() + 240
+    last_probe = ""
     for attempt in range(90):
         if time.monotonic() >= deadline:
             break
         readiness = ("if test -x /usr/local/bin/workspace-lease; then sudo /usr/local/bin/workspace-lease hold 600; fi; "
                      "test -f /var/lib/cloud/instance/boot-finished")
-        ready = subprocess.run(ssh_args(machine) + [readiness],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        ready = subprocess.run(ssh_args(machine) + [readiness], capture_output=True, text=True)
         if ready.returncode == 0:
             if active_jobs(machine):
                 remember_bridge(name, machine)
@@ -255,13 +256,15 @@ def connect(provider: Provider, name: str) -> Instance:
             remember_bridge(name, machine)
             print(f"{name}: private Coder bridge ready; default lease is five minutes")
             return machine
+        detail = (ready.stderr or ready.stdout or "").strip().splitlines()
+        last_probe = f"exit {ready.returncode}" + (f": {detail[-1]}" if detail else "")
         if attempt % 3 == 2:
             state = provider.get_instance(machine.id).state
             if state != "running":
                 subprocess.run(["systemctl", "--user", "stop", unit], capture_output=True)
                 raise RuntimeError("Workspace stopped while reconnecting; resume it before retrying")
         time.sleep(3)
-    raise RuntimeError("SSH/bootstrap did not become ready within its bounded startup allowance")
+    raise RuntimeError(f"SSH/bootstrap did not become ready within its bounded startup allowance ({last_probe})")
 
 
 def save_bridge_records(updates: dict, *, remove: list[str] | None = None) -> None:
@@ -367,6 +370,184 @@ subprocess.run(["git", "config", "--global", "credential.https://github.com.useH
     remote(machine, ["python3", "-c", install], input=json.dumps({"repo": repo, "credential": {
         "token": credential["token"], "expires_at": credential["expires_at"]}}))
     print(f"{name}: {repo} HTTPS authorization ({'write' if write else 'read-only'}), expires {credential['expires_at']}")
+
+
+def authorize_unity(provider: Provider, name: str, *, license_path: str | None = None,
+                    create_alf: bool = False, alf_out: str | None = None) -> None:
+    owner = api("users/me")["id"]
+    machine = provider.find_instance(name, owner)
+    if machine.state != "running":
+        raise RuntimeError("Resume the worker before configuring Unity licensing")
+    ensure_controller_ssh(provider, machine)
+    renew(provider, machine, 300)
+    remote(machine, ["sudo", "/usr/local/bin/workspace-lease", "hold", "300"])
+    unity_dir = STATE / "unity"
+    unity_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    unity_dir.chmod(0o700)
+    if create_alf:
+        stage = remote(machine, ["mktemp", "-d", "/tmp/unity-alf-XXXXXXXX"], capture_output=True).stdout.strip()
+        try:
+            remote(machine, ["bash", "-c",
+                f"cd {shlex.quote(stage)} && (unity-editor -batchmode -nographics -createManualActivationFile -logfile /tmp/unity-alf.log || true)"])
+            found = remote(machine, ["bash", "-c", f"ls -1 {shlex.quote(stage)}/*.alf 2>/dev/null | head -n 1"],
+                           capture_output=True).stdout.strip()
+            if not found:
+                log_tail = remote(machine, ["tail", "-n", "30", "/tmp/unity-alf.log"], capture_output=True).stdout
+                raise RuntimeError(f"Unity did not produce a .alf file:\n{log_tail}")
+            target = Path(alf_out).expanduser() if alf_out else (unity_dir / Path(found).name)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            data = remote(machine, ["base64", found], capture_output=True).stdout
+            import base64
+            target.write_bytes(base64.b64decode("".join(data.split())))
+            target.chmod(0o600)
+        finally:
+            remote(machine, ["rm", "-rf", stage, "/tmp/unity-alf.log"])
+        print(f"Saved Unity activation request to {target}")
+        print("Upload it at https://license.unity3d.com/manual and save the downloaded file to:")
+        print(f"  {unity_dir / 'Unity_lic.ulf'}")
+        return
+    source = Path(license_path).expanduser() if license_path else (unity_dir / "Unity_lic.ulf")
+    if not source.is_file():
+        raise RuntimeError(
+            f"Unity license file not found at {source}. "
+            f"Run authorize-unity {name} --create-alf, activate at https://license.unity3d.com/manual, "
+            f"and save Unity_lic.ulf there."
+        )
+    install = """
+import os, pathlib, sys
+os.umask(0o077)
+data = sys.stdin.buffer.read()
+for rel in (".local/share/unity3d/Unity/Unity_lic.ulf", ".config/unity3d/Unity/Unity_lic.ulf"):
+    target = pathlib.Path.home() / rel
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    target.write_bytes(data)
+    target.chmod(0o600)
+"""
+    subprocess.run(ssh_args(machine) + [shlex.join(["python3", "-c", install])],
+                   input=source.read_bytes(), check=True)
+    print(f"{name}: delivered private Unity license from {source} (mode 0600)")
+
+
+def list_images_cmd(providers: list[Provider], *, as_json: bool = False) -> None:
+    rows = []
+    for prov in providers:
+        try:
+            rows.extend(prov.list_images())
+        except Exception as error:
+            print(f"warning: could not query {prov.name} images: {error}", file=sys.stderr)
+    if as_json:
+        print(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        print("No private baked images.")
+        return
+    print(f"{'NAME':30} {'PROV':4} {'ARCH':5} {'HASH':10} {'ID'}")
+    for row in rows:
+        print(f"{row['name']:30} {row['provider']:4} {row['arch']:5} {row['hash'][:10]:10} {row['id']}")
+
+
+def bake_image(provider: Provider, settings: dict, *, spec_path: str,
+               instance_type: str | None = None, timeout: int = 2400, force: bool = False) -> dict:
+    min_gb = 50 if provider.name == "oci" else 30
+    spec = image_specs.load_spec(spec_path, default_disk_gb=min_gb)
+    disk_gb = max(min_gb, spec["disk_gb"])
+    existing = provider.list_images()
+    same_name = [img for img in existing if img["name"] == spec["name"]]
+    if not force:
+        exact = [img for img in same_name if img["hash"] == spec["hash"]]
+        if exact:
+            print(f"Image {spec['name']} ({spec['hash']}) already up to date: {exact[0]['id']}")
+            return exact[0]
+    size = instance_type or provider.default_builder_type(spec["arch"])
+    if provider.name == "oci":
+        is_arm_size = size.startswith("a1-")
+        if (spec["arch"] == "arm64") != is_arm_size:
+            raise RuntimeError(f"Spec arch {spec['arch']} does not match OCI builder size {size}")
+    elif spec["arch"] != "amd64":
+        raise RuntimeError("AWS template supports amd64 images only")
+    provider.assert_guard(instance_type=size, check_create=True, disk_gb=disk_gb)
+
+    builder = f"bake-{spec['hash'][:8]}-{uuid.uuid4().hex[:4]}"
+    command = [
+        "coder", "create", builder, "--template", provider.template_name, "--yes",
+        "--automatic-updates", "always",
+        "--parameter", "instance_type=" + size,
+        "--parameter", "disk_gb=" + str(disk_gb),
+        "--parameter", "image_id=",
+        "--parameter", "keep_workspace=false",
+        "--parameter", "t3_thread_id=",
+        "--parameter", "t3_thread_url=",
+    ]
+    log = STATE / (builder + "-build.log")
+    owner = api("users/me")["id"]
+    try:
+        print(f"Baking private {provider.name.upper()} image {spec['name']} ({spec['hash']}) on {builder} ({size}, {disk_gb} GiB)...", flush=True)
+        with log.open("w") as output:
+            process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
+            try:
+                process.wait(timeout=420)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+                raise RuntimeError(f"Builder creation timed out; see {log}")
+        if process.returncode:
+            tail = "\n".join(log.read_text(errors="replace").splitlines()[-20:])
+            raise RuntimeError(f"Builder creation failed; see {log}\n{tail}")
+        machine = connect(provider, builder)
+        renew(provider, machine, timeout + 600)
+        remote(machine, ["sudo", "/usr/local/bin/workspace-lease", "hold", str(timeout + 600)])
+        if spec["packages"]:
+            print(f"Installing {len(spec['packages'])} apt packages...", flush=True)
+            remote(machine, ["sudo", "env", "DEBIAN_FRONTEND=noninteractive", "apt-get",
+                             "-o", "DPkg::Lock::Timeout=120", "update", "-qq"])
+            remote(machine, ["sudo", "env", "DEBIAN_FRONTEND=noninteractive", "apt-get",
+                             "-o", "DPkg::Lock::Timeout=120", "install",
+                             "-y", "--no-install-recommends", *spec["packages"]])
+        if spec["setup_script_text"]:
+            print("Running image setup_script...", flush=True)
+            remote(machine, ["sudo", "tee", "/tmp/coder-bake-setup.sh"],
+                   input=spec["setup_script_text"], stdout=subprocess.DEVNULL)
+            remote(machine, ["sudo", "chmod", "0755", "/tmp/coder-bake-setup.sh"])
+            remote(machine, ["sudo", "-E", "bash", "/tmp/coder-bake-setup.sh"])
+            remote(machine, ["sudo", "rm", "-f", "/tmp/coder-bake-setup.sh"])
+        for cmd in spec["commands"]:
+            print(f"Running image command: {cmd}", flush=True)
+            remote(machine, ["sudo", "-E", "bash", "-lc", cmd])
+        # Sanitize builder state so fresh VMs booted from this image get clean cloud-init & new agent tokens.
+        sanitize = (
+            "set -e; "
+            "sudo systemctl stop coder-workspace.service coder-lease.timer "
+            "apt-daily.timer apt-daily-upgrade.timer || true; "
+            "sudo rm -rf /etc/systemd/system/coder-workspace.service /opt/coder-agent.sh "
+            "/var/lib/coder-workspace/lease.json /home/ubuntu/.config/coder-github "
+            "/home/ubuntu/.local/state/coder-jobs /home/ubuntu/.cache/coder-transfers "
+            "/home/ubuntu/projects/snapshots /tmp/coder-bake-*; "
+            "sudo apt-get -o DPkg::Lock::Timeout=120 clean || true; "
+            "sudo rm -rf /var/lib/apt/lists/*; "
+            "sudo cloud-init clean --logs --machine-id; "
+            "sync"
+        )
+        remote(machine, ["bash", "-c", sanitize])
+        print("Stopping builder before snapshotting private image...", flush=True)
+        transition(builder, "stop")
+        subprocess.run(["systemctl", "--user", "stop", bridge_unit(machine.id)], capture_output=True)
+        machine = provider.find_instance(builder, owner)
+        print("Creating private cloud image (waiting for AVAILABLE)...", flush=True)
+        created = provider.create_image(machine, image_name=spec["name"], image_hash=spec["hash"], arch=spec["arch"])
+        print(f"Private {provider.name.upper()} image ready: {created['name']} -> {created['id']}", flush=True)
+        for old in same_name:
+            if old["id"] != created["id"]:
+                try:
+                    provider.delete_image(old["id"])
+                    print(f"Removed superseded image {old['id']}", flush=True)
+                except Exception as error:
+                    print(f"warning: could not remove old image {old['id']}: {error}", file=sys.stderr)
+        return created
+    finally:
+        print(f"Cleaning up temporary builder {builder}...", flush=True)
+        try:
+            delete_workspace(provider, builder, force=True)
+        except Exception as error:
+            print(f"warning: builder cleanup failed for {builder}: {error}", file=sys.stderr)
 
 
 def project_record(name: str, machine: Instance | None = None) -> dict:
@@ -715,6 +896,16 @@ def build_parser(prog: str, default_provider: str, instance_types: tuple[str, ..
     gc_cmd.add_argument("--dry-run", action="store_true")
     gc_cmd.add_argument("--older-than-hours", type=int, default=None)
     gc_cmd.add_argument("--all", action="store_true")
+    images_cmd = sub.add_parser("images")
+    images_cmd.add_argument("--all", action="store_true", help="List private images across all configured providers")
+    images_cmd.add_argument("--json", action="store_true")
+    bake_cmd = sub.add_parser("bake-image")
+    bake_cmd.add_argument("--spec", required=True, help="Path to image spec JSON (e.g. .coder-images/unity.json)")
+    bake_cmd.add_argument("--instance-type", choices=list(instance_types), help="Temporary builder size")
+    bake_cmd.add_argument("--timeout", type=int, default=2400, help="Max bake setup seconds (default 2400)")
+    bake_cmd.add_argument("--force", action="store_true", help="Rebuild even if matching hash already exists")
+    del_img_cmd = sub.add_parser("delete-image")
+    del_img_cmd.add_argument("image", help="Scoped image name or cloud image ID")
     github_login = sub.add_parser("github-login-setup")
     github_login.add_argument("--port", type=int, default=8787)
     github_setup = sub.add_parser("github-setup")
@@ -722,7 +913,7 @@ def build_parser(prog: str, default_provider: str, instance_types: tuple[str, ..
     plan_command = sub.add_parser("plan")
     plan_command.add_argument("--manifest", required=True)
     workspace_actions = (
-        "authorize", "create", "sync", "link", "links", "resume", "connect",
+        "authorize", "authorize-unity", "create", "sync", "link", "links", "resume", "connect",
         "stop", "delete", "keep", "upgrade", "status", "hold", "extend",
         "run", "wait", "logs", "fetch",
     )
@@ -732,12 +923,17 @@ def build_parser(prog: str, default_provider: str, instance_types: tuple[str, ..
         if action == "authorize":
             command.add_argument("--repo", required=True)
             command.add_argument("--write", action="store_true", help="Grant repository contents write until token expiry")
+        if action == "authorize-unity":
+            command.add_argument("--license", help="Local Unity_lic.ulf path (default ~/.local/state/coder-workspaces/unity/Unity_lic.ulf)")
+            command.add_argument("--create-alf", action="store_true", help="Generate a manual activation .alf file on the worker")
+            command.add_argument("--alf-out", help="Output path when --create-alf is set")
         if action in ("hold", "extend", "run"):
             command.add_argument("--timeout", type=int, default=300, help="Finite timeout in seconds; default 300")
         if action == "create":
             command.add_argument("--manifest")
             command.add_argument("--instance-type", default=default_size, choices=list(instance_types))
             command.add_argument("--disk-gb", type=int, default=None, help="Root disk size in GiB (AWS: 30-100, OCI: 50-100)")
+            command.add_argument("--image", help="Private baked image name or cloud ID (see images)")
             command.add_argument("--keep", action="store_true", help="Exempt from automatic stopped-workspace deletion")
         if action in ("create", "link"):
             command.add_argument("--thread-id", default=os.environ.get("T3_THREAD_ID"), required=action == "link")
@@ -832,6 +1028,18 @@ def main(default_provider: str = "aws", prog: str | None = None) -> int:
         result = gc_workspaces(providers, settings, older_than_hours=args.older_than_hours, dry_run=args.dry_run)
         print(json.dumps(result, indent=2))
         return 0
+    if args.action == "images":
+        providers = configured_providers(settings) if args.all else [provider]
+        list_images_cmd(providers, as_json=args.json)
+        return 0
+    if args.action == "bake-image":
+        bake_image(provider, settings, spec_path=args.spec, instance_type=args.instance_type,
+                   timeout=args.timeout, force=args.force)
+        return 0
+    if args.action == "delete-image":
+        deleted = provider.delete_image(args.image)
+        print(f"Deleted private {provider.name.upper()} image {deleted['name']} ({deleted['id']})")
+        return 0
     if args.action == "configure-auth":
         if not isinstance(provider, AwsProvider):
             raise RuntimeError("configure-auth applies to AWS only; OCI uses ~/.oci/config")
@@ -848,6 +1056,10 @@ def main(default_provider: str = "aws", prog: str | None = None) -> int:
     if args.action == "authorize":
         authorize_repository(provider, args.workspace, args.repo, write=args.write)
         return 0
+    if args.action == "authorize-unity":
+        authorize_unity(provider, args.workspace, license_path=args.license,
+                        create_alf=args.create_alf, alf_out=args.alf_out)
+        return 0
     if args.action == "upgrade":
         upgrade(provider, args.workspace)
         return 0
@@ -857,16 +1069,18 @@ def main(default_provider: str = "aws", prog: str | None = None) -> int:
 
     if args.action in ("create", "resume"):
         if args.action == "create":
-            provider.assert_guard(instance_type=args.instance_type, check_create=True, disk_gb=args.disk_gb)
             min_gb = 50 if provider.name == "oci" else 30
             disk_gb = min_gb if args.disk_gb is None else args.disk_gb
             if not (min_gb <= disk_gb <= 100):
                 parser.error(f"--disk-gb for {provider.name} must be between {min_gb} and 100")
+            resolved_image = provider.resolve_image(args.image) if args.image else ""
+            provider.assert_guard(instance_type=args.instance_type, check_create=True, disk_gb=disk_gb)
             command = [
                 "coder", "create", args.workspace, "--template", provider.template_name, "--yes",
                 "--automatic-updates", "always",
                 "--parameter", "instance_type=" + args.instance_type,
                 "--parameter", "disk_gb=" + str(disk_gb),
+                "--parameter", "image_id=" + resolved_image,
                 "--parameter", "keep_workspace=" + ("true" if args.keep else "false"),
             ]
             for key, value in origin.items():

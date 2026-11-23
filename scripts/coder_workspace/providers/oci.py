@@ -414,15 +414,23 @@ class OciProvider(Provider):
     def set_tags(self, machine: Instance, tags: dict[str, str]) -> None:
         import oci
         compute = self._client("compute")
-        current = dict(compute.get_instance(machine.id).data.freeform_tags or {})
-        for key, value in tags.items():
-            # Stay within OCI's 10-tag freeform limit; omit non-essential SourceProjects and clear empties.
-            if key == "SourceProjects" or not value:
-                current.pop(key, None)
-            else:
-                current[key] = value
-        compute.update_instance(machine.id, oci.core.models.UpdateInstanceDetails(freeform_tags=current))
-        machine.tags = current
+        for attempt in range(8):
+            current = dict(compute.get_instance(machine.id).data.freeform_tags or {})
+            for key, value in tags.items():
+                # Stay within OCI's 10-tag freeform limit; omit non-essential SourceProjects and clear empties.
+                if key == "SourceProjects" or not value:
+                    current.pop(key, None)
+                else:
+                    current[key] = value
+            try:
+                compute.update_instance(machine.id, oci.core.models.UpdateInstanceDetails(freeform_tags=current))
+                machine.tags = current
+                return
+            except oci.exceptions.ServiceError as error:
+                if error.status == 409 and attempt < 7:
+                    time.sleep(2)
+                    continue
+                raise
 
     def ensure_ssh_access(self, machine: Instance, ssh_cidr: str) -> bool:
         """Update the workspace NSG's TCP/22 ingress rule if the controller's IPv4 changed."""
@@ -470,3 +478,77 @@ class OciProvider(Provider):
         if not metadata or "user_data" not in metadata:
             metadata = self._client("compute").get_instance(machine.id).data.metadata or {}
         return base64.b64decode(metadata["user_data"])
+
+    def default_builder_type(self, arch: str) -> str:
+        return "a1-2c-12g" if arch == "arm64" else "e5-4c-16g"
+
+    def list_images(self) -> list[dict]:
+        import oci
+        if not self.infra_path.exists():
+            return []
+        infra = self.load_infra()
+        items = oci.pagination.list_call_get_all_results(
+            self._client("compute").list_images,
+            compartment_id=infra["compartment_id"],
+            lifecycle_state="AVAILABLE",
+        ).data
+        results = []
+        for img in items:
+            tags = dict(img.freeform_tags or {})
+            if tags.get("ManagedBy") != self.manager:
+                continue
+            results.append({
+                "id": img.id,
+                "name": tags.get("ImageName", img.display_name or ""),
+                "hash": tags.get("ImageHash", ""),
+                "arch": tags.get("ImageArch", "amd64"),
+                "state": img.lifecycle_state.lower(),
+                "created": img.time_created.isoformat() if img.time_created else "",
+                "size_mb": getattr(img, "size_in_mbs", None),
+                "provider": "oci",
+            })
+        return sorted(results, key=lambda r: r["created"], reverse=True)
+
+    def resolve_image(self, ref: str) -> str:
+        if ref.startswith("ocid1.image."):
+            return ref
+        matches = [img for img in self.list_images() if img["name"] == ref]
+        if not matches:
+            raise RuntimeError(f"Private OCI image not found: {ref} (run coder-oci images)")
+        return matches[0]["id"]
+
+    def create_image(self, machine: Instance, *, image_name: str, image_hash: str, arch: str) -> dict:
+        import oci
+        infra = self.load_infra()
+        compute = self._client("compute")
+        created = compute.create_image(oci.core.models.CreateImageDetails(
+            compartment_id=infra["compartment_id"],
+            instance_id=machine.id,
+            display_name=f"coder-{image_name}-{image_hash[:8]}",
+            freeform_tags={
+                "ManagedBy": self.manager,
+                "ImageName": image_name,
+                "ImageHash": image_hash,
+                "ImageArch": arch,
+            },
+        )).data
+        deadline = time.monotonic() + 1800
+        while time.monotonic() < deadline:
+            current = compute.get_image(created.id).data
+            if current.lifecycle_state == "AVAILABLE":
+                return {
+                    "id": current.id, "name": image_name, "hash": image_hash,
+                    "arch": arch, "provider": "oci", "size_mb": getattr(current, "size_in_mbs", None),
+                }
+            if current.lifecycle_state not in ("PROVISIONING", "IMPORTING"):
+                raise RuntimeError(f"OCI image creation ended in state {current.lifecycle_state}")
+            time.sleep(15)
+        raise RuntimeError(f"Timed out waiting for OCI custom image {created.id} to become AVAILABLE")
+
+    def delete_image(self, ref: str) -> dict:
+        matches = [img for img in self.list_images() if img["id"] == ref or img["name"] == ref]
+        if not matches:
+            raise RuntimeError(f"Owned OCI image not found: {ref}")
+        target = matches[0]
+        self._client("compute").delete_image(target["id"])
+        return target

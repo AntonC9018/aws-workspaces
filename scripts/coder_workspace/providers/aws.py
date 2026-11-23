@@ -66,10 +66,23 @@ def controller_policy(settings: dict, account: str, subnets: dict) -> dict:
         {"Effect": "Allow", "Action": "ec2:RunInstances", "Resource": [
             f"arn:aws:ec2:{region}::image/{settings['ami_id']}", prefix + "network-interface/*",
             *[prefix + "subnet/" + subnet for subnet in subnets["ids"]]]},
+        {"Effect": "Allow", "Action": "ec2:RunInstances",
+         "Resource": f"arn:aws:ec2:{region}::image/*", "Condition": tagged},
         {"Effect": "Allow", "Action": "ec2:RunInstances", "Resource": [
             prefix + "security-group/*", prefix + "key-pair/*"], "Condition": tagged},
-        {"Effect": "Allow", "Action": "ec2:CreateTags", "Resource": resources,
-         "Condition": {"StringEquals": {"ec2:CreateAction": ["RunInstances", "CreateSecurityGroup", "ImportKeyPair"]}}},
+        {"Effect": "Allow", "Action": "ec2:CreateImage",
+         "Resource": [prefix + "instance/*", f"arn:aws:ec2:{region}::image/*", f"arn:aws:ec2:{region}::snapshot/*"],
+         "Condition": tagged},
+        {"Effect": "Allow", "Action": "ec2:CreateImage",
+         "Resource": [f"arn:aws:ec2:{region}::image/*", f"arn:aws:ec2:{region}::snapshot/*"],
+         "Condition": {"StringEquals": {"aws:RequestTag/ManagedBy": manager}}},
+        {"Effect": "Allow", "Action": "ec2:DeregisterImage",
+         "Resource": f"arn:aws:ec2:{region}::image/*", "Condition": tagged},
+        {"Effect": "Allow", "Action": "ec2:DeleteSnapshot",
+         "Resource": f"arn:aws:ec2:{region}::snapshot/*", "Condition": tagged},
+        {"Effect": "Allow", "Action": "ec2:CreateTags", "Resource": resources + [
+            f"arn:aws:ec2:{region}::image/*", f"arn:aws:ec2:{region}::snapshot/*"],
+         "Condition": {"StringEquals": {"ec2:CreateAction": ["RunInstances", "CreateSecurityGroup", "ImportKeyPair", "CreateImage"]}}},
         {"Effect": "Deny", "Action": "ec2:CreateTags", "Resource": resources,
          "Condition": {"ForAnyValue:StringEquals": {"aws:TagKeys": "ManagedBy"},
                        "StringNotEquals": {"aws:RequestTag/ManagedBy": manager}}},
@@ -335,3 +348,73 @@ class AwsProvider(Provider):
         encoded = self.session.client("ec2").describe_instance_attribute(
             InstanceId=machine.id, Attribute="userData")["UserData"]["Value"]
         return base64.b64decode(encoded)
+
+    def default_builder_type(self, arch: str) -> str:
+        if arch != "amd64":
+            raise RuntimeError("AWS template supports amd64 images only (use coder-oci for arm64)")
+        return "m7i-flex.xlarge"
+
+    def list_images(self) -> list[dict]:
+        ec2 = self.session.client("ec2")
+        found = ec2.describe_images(
+            Owners=["self"],
+            Filters=[{"Name": "tag:ManagedBy", "Values": [self.manager]}],
+        )["Images"]
+        results = []
+        for img in found:
+            tags = {t["Key"]: t["Value"] for t in img.get("Tags", [])}
+            snaps = [b["Ebs"]["SnapshotId"] for b in img.get("BlockDeviceMappings", [])
+                     if b.get("Ebs", {}).get("SnapshotId")]
+            results.append({
+                "id": img["ImageId"],
+                "name": tags.get("ImageName", img.get("Name", "")),
+                "hash": tags.get("ImageHash", ""),
+                "arch": tags.get("ImageArch", "amd64"),
+                "state": img.get("State", ""),
+                "created": img.get("CreationDate", ""),
+                "provider": "aws",
+                "snapshots": snaps,
+            })
+        return sorted(results, key=lambda r: r["created"], reverse=True)
+
+    def resolve_image(self, ref: str) -> str:
+        if ref.startswith("ami-"):
+            return ref
+        matches = [img for img in self.list_images() if img["name"] == ref and img["state"] == "available"]
+        if not matches:
+            raise RuntimeError(f"Private AWS image not found: {ref} (run coder-aws images)")
+        return matches[0]["id"]
+
+    def create_image(self, machine: Instance, *, image_name: str, image_hash: str, arch: str) -> dict:
+        ec2 = self.session.client("ec2")
+        ami_name = f"coder-{image_name}-{image_hash[:8]}"
+        tags = [
+            {"Key": "ManagedBy", "Value": self.manager},
+            {"Key": "ImageName", "Value": image_name},
+            {"Key": "ImageHash", "Value": image_hash},
+            {"Key": "ImageArch", "Value": arch},
+        ]
+        response = ec2.create_image(
+            InstanceId=machine.id,
+            Name=ami_name,
+            Description=f"Private Coder workspace image {image_name} ({image_hash})",
+            TagSpecifications=[
+                {"ResourceType": "image", "Tags": tags},
+                {"ResourceType": "snapshot", "Tags": tags},
+            ],
+        )
+        image_id = response["ImageId"]
+        waiter = ec2.get_waiter("image_available")
+        waiter.wait(ImageIds=[image_id], WaiterConfig={"Delay": 15, "MaxAttempts": 100})
+        return {"id": image_id, "name": image_name, "hash": image_hash, "arch": arch, "provider": "aws"}
+
+    def delete_image(self, ref: str) -> dict:
+        ec2 = self.session.client("ec2")
+        matches = [img for img in self.list_images() if img["id"] == ref or img["name"] == ref]
+        if not matches:
+            raise RuntimeError(f"Owned AWS image not found: {ref}")
+        target = matches[0]
+        ec2.deregister_image(ImageId=target["id"])
+        for snap in target.get("snapshots", []):
+            ec2.delete_snapshot(SnapshotId=snap)
+        return target

@@ -77,6 +77,15 @@ data "coder_parameter" "disk_gb" {
   }
 }
 
+data "coder_parameter" "image_id" {
+  name         = "image_id"
+  display_name = "Custom private AMI ID"
+  description  = "Optional private AMI ID (blank uses the base Ubuntu 24.04 image)."
+  type         = "string"
+  default      = ""
+  mutable      = false
+}
+
 data "coder_parameter" "instance_type" {
   name         = "instance_type"
   display_name = "Machine size"
@@ -152,8 +161,8 @@ resource "coder_agent" "dev" {
 }
 
 resource "aws_instance" "workspace" {
-  # Pin the tested Canonical Ubuntu 24.04 image; NixOS gets its own later template.
-  ami                                  = var.ami_id
+  # Pin the tested Canonical Ubuntu 24.04 image unless a private custom AMI is chosen.
+  ami                                  = data.coder_parameter.image_id.value != "" ? data.coder_parameter.image_id.value : var.ami_id
   instance_type                        = data.coder_parameter.instance_type.value
   subnet_id                            = sort(data.aws_subnets.default.ids)[0]
   associate_public_ip_address          = true

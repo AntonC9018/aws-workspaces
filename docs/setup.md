@@ -63,6 +63,25 @@ If your tenancy enforces an Always Free quota (for example `aws-infra/src/Oracle
 during quota preflight until the quota opens those families. After `oci_trial_expires` (default
 `2026-12-04`), paid shapes are blocked automatically.
 
+## Private per-project machine images
+
+Projects can define multiple image specs under `.coder-images/<name>.json` (with optional
+`packages`, `setup_script`, `commands`, `arch`, and `disk_gb`). Image names are scoped
+automatically by project (`<project>-<name>`). Both AWS AMIs and OCI custom images are private to
+your account or compartment and never include source checkouts or credentials:
+
+```sh
+coder-oci bake-image --spec .coder-images/unity-6000.json
+coder-oci images --all
+coder-oci create dev --image colorshoot-unity-6000 --instance-type e5-4c-16g --disk-gb 80
+coder-oci authorize-unity dev      # delivers ~/.local/state/coder-workspaces/unity/Unity_lic.ulf
+coder-oci delete-image colorshoot-unity-6000
+```
+
+Re-running `bake-image` skips work if the spec hash matches, or builds a fresh image and removes
+the superseded one when the spec changes. On AWS, run `coder-aws configure-auth` once after
+upgrading so the restricted controller policy allows private AMI creation and deletion.
+
 ## Dashboard login through GitHub
 
 `coder-aws github-login-setup` prepares a private GitHub login App with read-only

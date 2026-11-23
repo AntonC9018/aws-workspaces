@@ -11,27 +11,31 @@ Use `coder-aws` (AWS) or `coder-oci` (OCI) matching the worker's provider. If mi
 
 ## Sizes
 
-- `coder-aws` (x86_64): `t3.small` (2v/2G, default), `c7i-flex.large` (2v/4G), `m7i-flex.large` (2v/8G),
-  `c7i-flex.xlarge` (4v/8G), `m7i-flex.xlarge` (4v/16G). `--disk-gb` 30–100 (default 30).
+- `coder-aws` (x86_64): `t3.small` (2v/2G, default), `c7i-flex.large` (2v/4G),
+  `m7i-flex.large` (2v/8G), `c7i-flex.xlarge` (4v/8G), `m7i-flex.xlarge` (4v/16G).
+  `--disk-gb` 30–100 (default 30).
 - `coder-oci` (`coder-oci setup` once): `a1-2c-12g` (Always Free ARM64 2c/12G, default),
   `a1-4c-24g` (ARM64), `e5-2c-8g` / `e5-4c-16g` / `e5-8c-32g` (trial x86_64 4–16v/8–32G; needs
   quota beyond Always Free). `--disk-gb` 50–100 (default 50).
 
 Pick the smallest RAM-fitting size. Never expose dashboards or previews publicly. If a task needs
-environment setup beyond syncing the repo and running its install script, suggest adding a reusable
-profile/image for that project.
+environment setup beyond syncing the repo and running its install script, use an existing private
+image (`images` / `create --image`) or suggest adding a `.coder-images/<name>.json` spec and
+baking it with `bake-image --spec`.
 
 ## Lifecycle and cleanup
 
 ```sh
 coder-aws list --all
-coder-aws create NAME [--instance-type SIZE] [--disk-gb N] [--manifest FILE] [--thread-id ID] [--keep]
+coder-aws create NAME [--instance-type SIZE] [--disk-gb N] [--image NAME_OR_ID] [--manifest FILE] [--thread-id ID] [--keep]
 coder-aws run NAME [--project KEY] [--timeout 3600] [--wait] -- bash -c 'make build'
 coder-aws fetch NAME && coder-aws delete NAME
 ```
 
 Same commands on `coder-oci`: `status`, `plan --manifest`, `sync --manifest`, `wait`, `logs`,
-`extend --timeout`, `hold --timeout`, `stop`, `resume`, `connect`, `keep [--off]`, `gc`, `links`.
+`extend --timeout`, `hold --timeout`, `stop`, `resume`, `connect`, `keep [--off]`, `gc`, `links`,
+`images [--all]`, `bake-image --spec FILE`, `delete-image IMG`,
+`authorize-unity NAME [--create-alf]`.
 
 - **Always `delete NAME` after fetching/verifying** unless asked to keep it (`stop` bills 30–50 GiB
   disks; stopped workers without `--keep` auto-delete after 24h).
@@ -50,7 +54,8 @@ Same commands on `coder-oci`: `status`, `plan --manifest`, `sync --manifest`, `w
 ```
 
 - Validate with `plan --manifest`; `sync` needs an idle worker and never overwrites snapshots.
-  Separate projects for submodules; rejects LFS, symlinks, artifact globs, `.aws`/`.ssh`/`.gnupg`/`.git`.
+  Separate projects for submodules; rejects LFS, symlinks, artifact globs,
+  `.aws`/`.ssh`/`.gnupg`/`.git`.
 - Run `fetch NAME` only after job exit; writes verified output to
   `~/.local/state/coder-workspaces/results/NAME/` without editing local worktrees.
 - Never stream raw binaries over `coder ssh` stdout (PTY turns `\n` into `\r\n`). Use `fetch`
@@ -59,7 +64,8 @@ Same commands on `coder-oci`: `status`, `plan --manifest`, `sync --manifest`, `w
 ## T3 threads, Git, and secrets
 
 - T3 tasks: pass `--thread-id` from `t3_thread_configure` (never `CODEX_THREAD_ID`). Include the
-  printed Coder link in the reply; never use PR-linking tools; never overwrite a reused worker's thread.
+  printed Coder link in the reply; never use PR-linking tools; never overwrite a reused worker's
+  thread.
 - Keep AWS/OCI/GitHub keys local. Use `authorize NAME --repo OWNER/REPO` (1h, single-repo,
   read-only; `--write` only when asked to push). Snapshots lack `origin`; add HTTPS remote and push
   only on explicit request. Keep `Generated-by:` trailers per policy.

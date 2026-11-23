@@ -68,6 +68,15 @@ data "coder_parameter" "disk_gb" {
   }
 }
 
+data "coder_parameter" "image_id" {
+  name         = "image_id"
+  display_name = "Custom private OCI image OCID"
+  description  = "Optional private OCI custom image OCID (blank uses the base Ubuntu 24.04 image)."
+  type         = "string"
+  default      = ""
+  mutable      = false
+}
+
 data "coder_parameter" "instance_type" {
   name         = "instance_type"
   display_name = "Machine size"
@@ -182,7 +191,7 @@ resource "oci_core_instance" "workspace" {
 
   source_details {
     source_type             = "image"
-    source_id               = local.is_arm ? var.arm_image_id : var.x86_image_id
+    source_id               = data.coder_parameter.image_id.value != "" ? data.coder_parameter.image_id.value : (local.is_arm ? var.arm_image_id : var.x86_image_id)
     boot_volume_size_in_gbs = tonumber(data.coder_parameter.disk_gb.value)
   }
 

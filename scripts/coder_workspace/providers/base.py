@@ -89,3 +89,18 @@ class Provider:
 
     def read_userdata(self, machine: Instance) -> bytes:
         raise NotImplementedError
+
+    def default_builder_type(self, arch: str) -> str:
+        raise NotImplementedError
+
+    def list_images(self) -> list[dict]:
+        raise NotImplementedError
+
+    def resolve_image(self, ref: str) -> str:
+        raise NotImplementedError
+
+    def create_image(self, machine: Instance, *, image_name: str, image_hash: str, arch: str) -> dict:
+        raise NotImplementedError
+
+    def delete_image(self, ref: str) -> dict:
+        raise NotImplementedError
