@@ -35,6 +35,14 @@ data "coder_parameter" "t3_thread_url" {
   default      = ""
   mutable      = true
 }
+data "coder_parameter" "keep_workspace" {
+  name         = "keep_workspace"
+  display_name = "Exempt from automatic stopped-workspace deletion"
+  description  = "Set at creation; toggle later with coder-aws keep [--off] NAME."
+  type         = "string"
+  default      = "false"
+  mutable      = false
+}
 locals {
   workspace_url = "${var.coder_url}/@${data.coder_workspace_owner.me.name}/${data.coder_workspace.me.name}"
   origin_tags = merge({
@@ -57,10 +65,32 @@ data "aws_subnets" "default" {
   }
 }
 
+data "coder_parameter" "disk_gb" {
+  name         = "disk_gb"
+  display_name = "Root disk size (GiB)"
+  description  = "Encrypted gp3 root volume size (30–100 GiB)."
+  type         = "number"
+  default      = "30"
+  mutable      = false
+  validation {
+    min = 30
+    max = 100
+  }
+}
+
+data "coder_parameter" "image_id" {
+  name         = "image_id"
+  display_name = "Custom private AMI ID"
+  description  = "Optional private AMI ID (blank uses the base Ubuntu 24.04 image)."
+  type         = "string"
+  default      = ""
+  mutable      = false
+}
+
 data "coder_parameter" "instance_type" {
   name         = "instance_type"
   display_name = "Machine size"
-  description  = "Choose for actual RAM needs. Only account-eligible x86 machines are listed."
+  description  = "Choose for actual RAM needs. Account-eligible x86 machines."
   default      = "t3.small"
   mutable      = false
   option {
@@ -74,6 +104,14 @@ data "coder_parameter" "instance_type" {
   option {
     name  = "Build — 2 vCPU / 8 GiB"
     value = "m7i-flex.large"
+  }
+  option {
+    name  = "Heavy build — 4 vCPU / 8 GiB"
+    value = "c7i-flex.xlarge"
+  }
+  option {
+    name  = "Heavy build / Unity — 4 vCPU / 16 GiB"
+    value = "m7i-flex.xlarge"
   }
 }
 
@@ -101,6 +139,9 @@ resource "aws_security_group" "workspace" {
     cidr_blocks = ["0.0.0.0/0"]
   }
   tags = merge(local.origin_tags, { ManagedBy = var.managed_by })
+  lifecycle {
+    ignore_changes = [ingress]
+  }
 }
 
 resource "coder_agent" "dev" {
@@ -124,8 +165,8 @@ resource "coder_agent" "dev" {
 }
 
 resource "aws_instance" "workspace" {
-  # Pin the tested Canonical Ubuntu 24.04 image; NixOS gets its own later template.
-  ami                                  = var.ami_id
+  # Pin the tested Canonical Ubuntu 24.04 image unless a private custom AMI is chosen.
+  ami                                  = data.coder_parameter.image_id.value != "" ? data.coder_parameter.image_id.value : var.ami_id
   instance_type                        = data.coder_parameter.instance_type.value
   subnet_id                            = sort(data.aws_subnets.default.ids)[0]
   associate_public_ip_address          = true
@@ -138,7 +179,7 @@ resource "aws_instance" "workspace" {
   }
   root_block_device {
     volume_type           = "gp3"
-    volume_size           = 30
+    volume_size           = tonumber(data.coder_parameter.disk_gb.value)
     encrypted             = true
     delete_on_termination = true
   }
@@ -192,12 +233,19 @@ resource "aws_instance" "workspace" {
     WorkspaceId    = data.coder_workspace.me.id
     WorkspaceName  = data.coder_workspace.me.name
     OwnerId        = data.coder_workspace_owner.me.id
+    KeepWorkspace  = data.coder_parameter.keep_workspace.value
     LeaseExpiresAt = timeadd(timestamp(), "15m")
   })
   lifecycle {
     # Explicit start/stop reconciliations refresh the startup allowance.
     # EC2 reports this false while stopped; it must not cause replacement.
-    ignore_changes  = [associate_public_ip_address, tags["SourceSnapshot"], tags["SourceProjects"]]
+    ignore_changes = [
+      associate_public_ip_address,
+      tags["SourceSnapshot"],
+      tags["SourceProjects"],
+      tags["StoppedSince"],
+      tags["KeepWorkspace"],
+    ]
   }
 }
 

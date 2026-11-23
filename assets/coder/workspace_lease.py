@@ -38,7 +38,7 @@ def main():
         update(lambda s: s.update(until=time.time() + DEFAULT_TIMEOUT))
     elif args.action == "status":
         print(STATE.read_text())
-    elif update(lambda s: s["until"] <= time.time()):
+    elif update(lambda s: (s.update(until=time.time() + 600) or False) if s["until"] == 0 else s["until"] <= time.time()):
         subprocess.run(["systemctl", "poweroff"], check=True)
 
 

@@ -101,7 +101,7 @@ let
   '';
   reconcileUnit = writeTextDir "lib/systemd/user/coder-reconcile.service" ''
     [Unit]
-    Description=Connect Coder dashboard-started AWS workers
+    Description=Reconcile Coder AWS and OCI workspace bridges, leases, and stale cleanup
     After=coder-trial.service
     PartOf=coder-trial.service
     [Service]

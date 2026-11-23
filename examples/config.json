@@ -7,5 +7,11 @@
   "coder_url": "http://127.0.0.1:7080",
   "thread_base_url": "",
   "github_owner": "",
-  "github_app_name": "AWS Workspaces"
+  "github_app_name": "AWS Workspaces",
+  "delete_after_stopped_hours": "24",
+  "oci_profile": "AWS_INFRA",
+  "oci_region": "eu-turin-1",
+  "oci_compartment_name": "coder-workspaces",
+  "oci_trial_expires": "2026-12-04",
+  "oci_trial_spend_limit_usd": "250"
 }

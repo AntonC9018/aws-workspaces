@@ -16,6 +16,8 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(value["managed_by"], "coder-workspaces")
         self.assertEqual(value["coder_url"], "http://127.0.0.1:7080")
         self.assertEqual(value["github_owner"], "")
+        self.assertEqual(value["delete_after_stopped_hours"], "24")
+        self.assertEqual(value["oci_region"], "eu-turin-1")
 
     def test_existing_deployment_names_and_urls_can_be_preserved(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -33,9 +35,21 @@ class SettingsTests(unittest.TestCase):
             path.write_text(json.dumps({"session_duration": "876000h"}))
             self.assertEqual(settings.load(path)["session_duration"], "876000h")
 
-    def test_invalid_configuration_fails_before_aws_operations(self):
-        for value in ({"session_duration": "0h"}, {"session_duration": "876001h"}, {"region": "us-east-1"}, {"managed_by": "../bad"},
-                      {"coder_url": "https://user:secret@example.com"}, {"unknown": "value"}):
+    def test_invalid_configuration_fails_before_cloud_operations(self):
+        bad_values = (
+            {"session_duration": "0h"},
+            {"session_duration": "876001h"},
+            {"region": "us-east-1"},
+            {"oci_region": "eu-frankfurt-1"},
+            {"managed_by": "../bad"},
+            {"coder_url": "https://user:secret@example.com"},
+            {"delete_after_stopped_hours": "999"},
+            {"oci_trial_expires": "not-a-date"},
+            {"oci_trial_spend_limit_usd": "-5"},
+            {"oci_subnet_id": "not-an-ocid"},
+            {"unknown": "value"},
+        )
+        for value in bad_values:
             with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / "config.json"
                 path.write_text(json.dumps(value))
