@@ -43,6 +43,26 @@ This installs the commands, settings and agent skill. Other setups can link
 `skills/aws-workspace` into their agent's skills directory. Read the skill before
 letting an agent provision machines.
 
+## Oracle Cloud (OCI)
+
+`coder-oci` uses `~/.oci/config` (default profile `AWS_INFRA`, region `eu-turin-1`). Run
+`coder-oci setup` once to create:
+
+- the isolated `coder-workspaces` compartment,
+- one shared VCN (`10.42.0.0/16`), Internet Gateway, route table, egress-only security list, and
+  public subnet (`10.42.1.0/24`),
+- a compartment spend budget matching `oci_trial_spend_limit_usd`, and
+- the `oci-private` Coder template.
+
+OCI Free Trial allows only **one** Internet Gateway per tenancy. If another VCN already holds your
+Internet Gateway, set `oci_subnet_id` in `config.json` to reuse that public subnet, or run
+`coder-oci teardown-network` after deleting all OCI workspaces to free the gateway.
+
+If your tenancy enforces an Always Free quota (for example `aws-infra/src/Oracle/quotas.ts`),
+`a1-2c-12g` works out of the box at $0 cost while paid trial shapes (`e5-*`, `a1-4c-24g`) fail fast
+during quota preflight until the quota opens those families. After `oci_trial_expires` (default
+`2026-12-04`), paid shapes are blocked automatically.
+
 ## Dashboard login through GitHub
 
 `coder-aws github-login-setup` prepares a private GitHub login App with read-only
@@ -86,9 +106,10 @@ links, or pass `--thread-url` explicitly. EC2 tags record the creating thread
 and Coder URL. Include the printed Coder link in the agent's reply. Filter EC2
 by `CreatedVia=Coder`, or Coder by `template:aws-private`.
 
-Run `publish-template` after a controller public IPv4 change, then reconcile the
-workspace security group before reconnecting. A dashboard start restores its
-bridge once; open SSH sessions do not renew idle leases indefinitely.
+If your controller public IPv4 address changes, `connect` and remote actions automatically update
+the workspace's AWS security group or OCI NSG TCP/22 rule; run `publish-template` so newly created
+workspaces also receive the new address immediately. A dashboard start restores its bridge once;
+open SSH sessions do not renew idle leases indefinitely.
 
 ## GitHub
 
@@ -125,5 +146,7 @@ updates the disk's deletion flag in place without starting the worker. For a
 running workspace, finish or fetch active work before updating it. Verify the
 root block device has `DeleteOnTermination=true` in EC2 before deleting.
 
-Use the dashboard Delete action or `coder delete NAME --yes`. Stopping keeps
-the disk; deleting permanently removes it. Do not use `--orphan` for cleanup.
+Use `coder-aws delete NAME`, `coder-oci delete NAME`, the dashboard Delete action, or
+`coder delete NAME --yes`. Stopping keeps the disk; deleting permanently removes it. Do not use
+`--orphan` for cleanup. Stopped workspaces without `--keep` are deleted automatically by
+`reconcile` / `gc` after `delete_after_stopped_hours` (default `24`).

@@ -1,84 +1,62 @@
 ---
 name: aws-workspace
-description: Offload builds and commands to Coder-managed AWS workers with bounded jobs, persistent disks and explicit source/result transfer.
+description: Offload builds and commands to Coder-managed AWS or Oracle Cloud workers with bounded jobs, persistent disks, explicit source/result transfer, and cleanup.
 ---
 
-# AWS workspaces
+# Cloud workspaces (`coder-aws` / `coder-oci`)
 
-Use `coder-aws` and `coder-trial` from PATH, or `nix run <checkout>#coder-aws --`.
-The Home Manager installation links into the full pinned repository: resolve
-this skill directory with `realpath`, then go two directories up to find its
-flake and `docs/setup.md`. This also supplies a checkout path for `nix run` when
-the commands are not on PATH.
-Credentials stay outside Git and the Nix store. Never copy controller AWS keys,
-App signing keys or a broad personal GitHub token to a worker.
+Use `coder-aws` (AWS) or `coder-oci` (OCI) matching the worker's provider. If missing from PATH,
+`realpath` this skill dir and go two dirs up for `nix run <dir>#coder-aws --` (`#coder-oci`) and
+`docs/setup.md`. If local Coder refuses connection, run `coder-trial start`.
 
-## Jobs and stopping
+## Sizes
 
-Job timeout defaults to **300 seconds**. Choose a longer finite timeout before a
-long build. Open SSH sessions, editors and preview servers do not renew leases.
-Completed jobs return to a five-minute idle countdown. Use an explicit finite
-hold for quiet interactive work. Agent failure or rate limits must leave a
-shutdown deadline in place.
+- `coder-aws` (x86_64): `t3.small` (2v/2G, default), `c7i-flex.large` (2v/4G), `m7i-flex.large` (2v/8G).
+- `coder-oci` (`coder-oci setup` once): `a1-2c-12g` (Always Free ARM64 2c/12G, default),
+  `a1-4c-24g` (ARM64), `e5-2c-8g` / `e5-4c-16g` / `e5-8c-32g` (trial x86_64 4–16v/8–32G; needs
+  quota beyond Always Free).
+
+Pick the smallest RAM-fitting size. Never expose dashboards or previews publicly.
+
+## Lifecycle and cleanup
 
 ```sh
-coder-aws create build --manifest workspace.json
-coder-aws run build --project app --timeout 7200 -- make build
-coder-aws extend build --timeout 3600
-coder-aws hold build --timeout 600
-coder-aws fetch build
-coder-aws stop build
-coder-aws resume build
+coder-aws list --all
+coder-aws create NAME [--instance-type SIZE] [--manifest FILE] [--thread-id ID] [--keep]
+coder-aws run NAME [--project KEY] [--timeout 3600] [--wait] -- bash -c 'make build'
+coder-aws fetch NAME && coder-aws delete NAME
 ```
 
-Jobs are detached systemd services. Use a shell explicitly for shell syntax.
-One registered job runs per worker. Choose RAM for the actual work and avoid
-unneeded capacity. Stopping preserves disks; storage still consumes credits.
-Explicit dashboard Delete or `coder delete NAME` permanently removes the
-instance and root disk. Fetch needed results first.
-No automatic deletion is configured.
+Same commands on `coder-oci`: `status`, `plan --manifest`, `sync --manifest`, `wait`, `logs`,
+`extend --timeout`, `hold --timeout`, `stop`, `resume`, `connect`, `keep [--off]`, `gc`, `links`.
 
-`connect` restores a bridge to a running worker; `resume` starts a stopped one.
-Do not expose dashboards or previews publicly. Use the existing IPv4 networking;
-IPv6-only GitHub access remains a recorded blocker. This Ubuntu template does
-not validate NixOS boot or KVM availability.
+- **Always `delete NAME` after fetching/verifying** unless asked to keep it (`stop` bills 30–50 GiB
+  disks; stopped workers without `--keep` auto-delete after 24h).
+- Default timeout is **300s**; pass finite `--timeout` for long builds. One detached systemd job
+  runs per worker; wrap shell syntax in `bash -c '...'`. Use `--wait`, `wait`, or `logs` (not raw
+  SSH polling). Finished jobs drop to a 5m idle lease.
+- `extend NAME --timeout SEC` requires an active job; use `hold NAME --timeout SEC` for idle work
+  or previews. `resume NAME` takes no `--timeout` (follow with `hold`). SSH/editors do not renew
+  leases.
+- `--project KEY` must match `projects[].name` in the manifest (omit for `/home/ubuntu/projects`).
 
-## Sources and retrieval
+## Manifest and binary transfer
 
-Select needed repositories, revisions and extra files in a version-1 JSON
-manifest. Preview with `plan --manifest FILE`, then use `create --manifest FILE`
-or `sync NAME --manifest FILE` on an idle worker. See `docs/sources.md`.
-Include untracked files explicitly. Never copy a whole home or credential store.
-Existing remote snapshots are not overwritten. Submodules, LFS and symlinks
-need separate handling; report unsupported inputs instead of omitting them.
+```json
+{"version":1,"projects":[{"name":"app","path":"../repo","revision":"HEAD","destination":"src/app","include_untracked":["a.txt"],"artifacts":["dist"]}],"files":[{"source":"c.txt","destination":"shared/c.txt"}]}
+```
 
-Fetch only after the job finishes. It returns commits, dirty files, logs and
-selected artifacts into separate local checkouts, preserving concurrent local
-edits. Inspect results and merge or cherry-pick deliberately. If the controller
-was off, fetch when the agent returns. There is no background retrieval or
-implicit push.
+- Validate with `plan --manifest`; `sync` needs an idle worker and never overwrites snapshots.
+  Separate projects for submodules; rejects LFS, symlinks, artifact globs, `.aws`/`.ssh`/`.gnupg`/`.git`.
+- Run `fetch NAME` only after job exit; writes verified output to
+  `~/.local/state/coder-workspaces/results/NAME/` without editing local worktrees.
+- Never stream raw binaries over `coder ssh` stdout (PTY turns `\n` into `\r\n`). Use `fetch`
+  artifacts, `scp`, or `coder ssh NAME -- 'base64 FILE' | tr -d '\r' | base64 -d > FILE`.
 
-Never stream raw binary files (such as PNGs or archives) over `coder ssh`
-stdout: `coder ssh` allocates a PTY that translates `\n` to `\r\n`, corrupting
-binary files and breaking downstream image-read tools. Transfer images and other
-binaries with `coder-aws fetch` (declared as manifest artifacts), `scp`, or
-`base64` (`coder ssh NAME -- 'base64 FILE' | tr -d '\r' | base64 -d > FILE`).
+## T3 threads, Git, and secrets
 
-## Threads and Git
-
-For T3 tasks, obtain the app thread ID from `t3_thread_configuration` and pass
-`--thread-id` at creation. Never use `CODEX_THREAD_ID`, which identifies the
-provider session. Supply `--thread-url` if no thread base URL is configured.
-Do not replace an existing machine's creating thread when reusing it.
-Include the printed Coder link in the thread's reply. T3 has no generic
-workspace toolbar API; do not misuse pull-request linking.
-
-`authorize NAME --repo OWNER/REPO` issues a one-hour, one-repository, read-only
-HTTPS credential. Add `--write` only when the agent requests push access.
-Installation access can cover all repositories while worker tokens stay narrow.
-Renew expired authorization with the controller online. Source snapshots have
-no origin; add the intended HTTPS remote explicitly before pushing.
-
-Remote authorship follows configured local Git identity at template publication.
-Keep model attribution trailers where the user's policy requires them. Pushes
-must be explicit agent actions, never completion or retrieval hooks.
+- T3 tasks: pass `--thread-id` from `t3_thread_configure` (never `CODEX_THREAD_ID`). Include the
+  printed Coder link in the reply; never use PR-linking tools; never overwrite a reused worker's thread.
+- Keep AWS/OCI/GitHub keys local. Use `authorize NAME --repo OWNER/REPO` (1h, single-repo,
+  read-only; `--write` only when asked to push). Snapshots lack `origin`; add HTTPS remote and push
+  only on explicit request. Keep `Generated-by:` trailers per policy.
