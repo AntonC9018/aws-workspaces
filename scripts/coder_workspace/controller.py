@@ -602,6 +602,85 @@ UNITY_AUTH_ROOTS = (
     # Unity CLI 1.x keeps its session in the Hub account store and the auth broker.
     ".config/unityhub", ".local/share/UnityAuthBroker", ".local/share/unity-keyring",
 )
+UNITY_FILE_STORE_ENV = ("UNITY_INSECURE_STORAGE=1", "UNITY_NO_AUTH_BROKER=1")
+
+
+def _unity_unpack_script() -> str:
+    roots_literal = repr(UNITY_AUTH_ROOTS)
+    return f"""
+import io, os, pathlib, sys, tarfile
+os.umask(0o077)
+home = pathlib.Path.home().resolve()
+roots = {roots_literal}
+stale_seal = home / ".local/share/UnityAuthBroker/token-store.seal"
+if stale_seal.exists() or stale_seal.is_symlink():
+    stale_seal.unlink()
+with tarfile.open(fileobj=io.BytesIO(sys.stdin.buffer.read()), mode="r") as tf:
+    for member in tf.getmembers():
+        if not member.isfile():
+            raise RuntimeError("unsafe non-file entry in Unity auth bundle")
+        posix = pathlib.Path(member.name).as_posix().removeprefix("./")
+        if ".." in pathlib.Path(member.name).parts or not any(posix.startswith(r + "/") for r in roots):
+            raise RuntimeError("unsafe path outside Unity auth roots")
+        dest = (home / posix).resolve()
+        if not dest.is_relative_to(home):
+            raise RuntimeError("unsafe path in Unity auth bundle")
+        dest.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        data = tf.extractfile(member).read()
+        if dest.suffix == ".db" or data.startswith(b"SQLite format 3\\x00"):
+            for sidecar in ("-wal", "-shm", "-journal"):
+                stale = dest.with_name(dest.name + sidecar)
+                if stale.exists() or stale.is_symlink():
+                    stale.unlink()
+        tmp = dest.with_name(dest.name + ".tmp")
+        tmp.write_bytes(data)
+        tmp.chmod(0o600)
+        os.replace(tmp, dest)
+"""
+
+
+def _unity_pack_script() -> str:
+    roots_literal = repr(UNITY_AUTH_ROOTS)
+    return f"""
+import io, pathlib, sqlite3, sys, tarfile, tempfile
+home = pathlib.Path.home()
+roots = {roots_literal}
+excluded_dirs = ("/licenses/", "/Editor/", "/logs/", "/external-modules/", "/dpop-tpm2/")
+excluded_suffixes = (".log", ".db-wal", ".db-shm", ".db-journal", ".seal", ".lock")
+buf = io.BytesIO()
+with tempfile.TemporaryDirectory() as tmpdir, tarfile.open(fileobj=buf, mode="w") as tf:
+    snap_path = pathlib.Path(tmpdir) / "snapshot.db"
+    for rel in roots:
+        base = home / rel
+        if not base.exists() or base.is_symlink():
+            continue
+        for path in sorted(base.rglob("*")):
+            if path.is_symlink() or not path.is_file():
+                continue
+            sub = path.relative_to(home).as_posix()
+            if any(part in sub for part in excluded_dirs) or sub.endswith(excluded_suffixes):
+                continue
+            with path.open("rb") as fh:
+                header = fh.read(16)
+            if header == b"SQLite format 3\\x00":
+                if snap_path.exists():
+                    snap_path.unlink()
+                src = sqlite3.connect(str(path), timeout=5.0)
+                dst = sqlite3.connect(str(snap_path))
+                try:
+                    src.backup(dst)
+                finally:
+                    dst.close()
+                    src.close()
+                payload = snap_path.read_bytes()
+                info = tarfile.TarInfo(sub)
+                info.size = len(payload)
+                info.mode = 0o600
+                tf.addfile(info, io.BytesIO(payload))
+            else:
+                tf.add(path, arcname=sub)
+sys.stdout.buffer.write(buf.getvalue())
+"""
 
 
 def _validate_unity_auth_bundle(raw: bytes) -> int:
@@ -651,12 +730,27 @@ def _run_authorize_unity(provider: Provider, name: str, machine: Instance, *,
     unity_dir.chmod(0o700)
 
     if return_license:
+        ret = subprocess.run(
+            ssh_args(machine) + [
+                "bash -c 'if command -v unity >/dev/null; then "
+                "env UNITY_INSECURE_STORAGE=1 UNITY_NO_AUTH_BROKER=1 unity license return -y; fi'"
+            ],
+            capture_output=True, text=True,
+        )
+        detail = ((ret.stderr or "") + "\n" + (ret.stdout or "")).strip()
+        personal_non_returnable = "Personal licenses, can't be returned" in detail or "no license" in detail.lower()
+        if ret.returncode != 0 and not personal_non_returnable:
+            raise RuntimeError(
+                f"Failed to return Unity license on {name} (exit {ret.returncode}); "
+                f"keeping worker Unity session for retry.\n{detail}"
+            )
         remote(machine, ["bash", "-c",
-            "set -e; "
-            "if command -v unity >/dev/null; then unity license return -y; fi; "
             "rm -rf ~/.config/unity* ~/.local/share/unity* ~/.config/Unity ~/.local/share/Unity ~/.unity "
             "~/.local/share/UnityAuthBroker"])
-        print(f"{name}: returned Unity license and cleared worker Unity session")
+        if ret.returncode != 0:
+            print(f"{name}: Unity Personal license cannot be returned remotely; cleared worker Unity session")
+        else:
+            print(f"{name}: returned Unity license and cleared worker Unity session")
         return
 
     if create_alf:
@@ -711,64 +805,38 @@ for rel in (".local/share/unity3d/Unity/Unity_lic.ulf", ".config/unity3d/Unity/U
             "or pass --license FILE for an Enterprise .ulf."
         )
     bundle = unity_dir / "auth-bundle.tar"
-    roots_literal = repr(UNITY_AUTH_ROOTS)
     if not login and bundle.is_file():
         bundle_bytes = bundle.read_bytes()
         if _validate_unity_auth_bundle(bundle_bytes) == 0:
             raise RuntimeError(f"Cached Unity auth bundle at {bundle} is empty; run with --login")
-        unpack = f"""
-import io, os, pathlib, sys, tarfile
-os.umask(0o077)
-home = pathlib.Path.home().resolve()
-roots = {roots_literal}
-with tarfile.open(fileobj=io.BytesIO(sys.stdin.buffer.read()), mode="r") as tf:
-    for member in tf.getmembers():
-        if not member.isfile():
-            raise RuntimeError("unsafe non-file entry in Unity auth bundle")
-        posix = pathlib.Path(member.name).as_posix().removeprefix("./")
-        if ".." in pathlib.Path(member.name).parts or not any(posix.startswith(r + "/") for r in roots):
-            raise RuntimeError("unsafe path outside Unity auth roots")
-        dest = (home / posix).resolve()
-        if not dest.is_relative_to(home):
-            raise RuntimeError("unsafe path in Unity auth bundle")
-        dest.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        dest.write_bytes(tf.extractfile(member).read())
-        dest.chmod(0o600)
-"""
-        subprocess.run(ssh_args(machine) + [shlex.join(["python3", "-c", unpack])],
+        subprocess.run(ssh_args(machine) + [shlex.join(["python3", "-c", _unity_unpack_script()])],
                        input=bundle_bytes, check=True)
-        status = subprocess.run(ssh_args(machine) + ["unity auth status"], capture_output=True, text=True)
+        status = subprocess.run(
+            ssh_args(machine) + [shlex.join(["env", *UNITY_FILE_STORE_ENV, "unity", "auth", "status"])],
+            capture_output=True, text=True,
+        )
         if status.returncode != 0:
+            detail = (status.stderr or status.stdout or "").strip()
+            suffix = f"\n{detail}" if detail else ""
             raise RuntimeError(
                 f"Cached Unity session was rejected on {name}; re-authenticate with:\n"
-                f"  coder-{provider.name} authorize-unity {name} --login"
+                f"  coder-{provider.name} authorize-unity {name} --login{suffix}"
             )
     else:
         print(f"{name}: starting Unity CLI browser sign-in (open the printed URL on your laptop)...", flush=True)
-        subprocess.run(
-            ssh_args(machine) + ["env BROWSER=true unity auth login --insecure-storage"],
-            check=True,
+        # Unity CLI 1.x prefers the RAM-only Linux kernel keyring (keyutils) whenever @keyring syscalls
+        # succeed, skipping credentials.json even with --insecure-storage. Run login with ~@keyring
+        # (matching standard container seccomp) so Unity writes its documented plain-file store.
+        login_cmd = (
+            'UNITY_BIN=$(command -v unity) && '
+            'exec sudo systemd-run --quiet --collect --uid="$(id -u)" --gid="$(id -g)" --pipe --wait '
+            '-p SystemCallErrorNumber=EPERM -p SystemCallFilter=~@keyring '
+            '-p "Environment=HOME=$HOME" -p Environment=BROWSER=true '
+            '-p Environment=UNITY_INSECURE_STORAGE=1 -p Environment=UNITY_NO_AUTH_BROKER=1 '
+            '"$UNITY_BIN" auth login --insecure-storage'
         )
-        pack = f"""
-import io, pathlib, sys, tarfile
-home = pathlib.Path.home()
-roots = {roots_literal}
-buf = io.BytesIO()
-with tarfile.open(fileobj=buf, mode="w") as tf:
-    for rel in roots:
-        base = home / rel
-        if not base.exists() or base.is_symlink():
-            continue
-        for path in sorted(base.rglob("*")):
-            if path.is_symlink() or not path.is_file():
-                continue
-            sub = path.relative_to(home).as_posix()
-            if "/licenses/" in sub or "/Editor/" in sub or sub.endswith((".log", ".db", ".db-wal", ".db-shm")):
-                continue
-            tf.add(path, arcname=sub)
-sys.stdout.buffer.write(buf.getvalue())
-"""
-        packed = subprocess.run(ssh_args(machine) + [shlex.join(["python3", "-c", pack])],
+        subprocess.run(ssh_args(machine) + [login_cmd], check=True)
+        packed = subprocess.run(ssh_args(machine) + [shlex.join(["python3", "-c", _unity_pack_script()])],
                                 capture_output=True, check=True).stdout
         if _validate_unity_auth_bundle(packed) > 0:
             tmp = bundle.with_suffix(".tmp")
@@ -776,9 +844,11 @@ sys.stdout.buffer.write(buf.getvalue())
             tmp.chmod(0o600)
             os.replace(tmp, bundle)
             print(f"Cached Unity CLI auth state to {bundle} (mode 0600)", flush=True)
+        else:
+            print("warning: no Unity CLI auth files found to cache", file=sys.stderr, flush=True)
 
-    remote(machine, ["unity", "license", "activate", "--personal", "--accept-eula"])
-    remote(machine, ["unity", "license", "status"])
+    remote(machine, ["env", *UNITY_FILE_STORE_ENV, "unity", "license", "activate", "--personal", "--accept-eula"])
+    remote(machine, ["env", *UNITY_FILE_STORE_ENV, "unity", "license", "status"])
     print(f"{name}: Unity Personal license activated")
 
 

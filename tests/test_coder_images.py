@@ -159,9 +159,10 @@ class ImageSpecTests(unittest.TestCase):
             self.assertEqual(len(lease_calls), 2)
             self.assertTrue(lease_calls[0][5].startswith("op:unity-"))
             self.assertEqual(lease_calls[1][2:5], ["release", "--owner", lease_calls[0][5]])
-            self.assertIn(["unity", "license", "activate", "--personal", "--accept-eula"], remote_calls)
-            self.assertIn(["unity", "license", "status"], remote_calls)
-            self.assertTrue(any("unity auth login --insecure-storage" in " ".join(c.args[0])
+            self.assertIn(["env", *controller.UNITY_FILE_STORE_ENV, "unity", "license", "activate", "--personal", "--accept-eula"], remote_calls)
+            self.assertIn(["env", *controller.UNITY_FILE_STORE_ENV, "unity", "license", "status"], remote_calls)
+            self.assertTrue(any("SystemCallFilter=~@keyring" in " ".join(c.args[0])
+                                and "auth login --insecure-storage" in " ".join(c.args[0])
                                 for c in run_mock.call_args_list))
 
     def test_unity_auth_bundle_rejects_paths_outside_unity_roots_and_empty_tar(self):
@@ -180,6 +181,188 @@ class ImageSpecTests(unittest.TestCase):
             tf.addfile(info, io.BytesIO(payload))
         with self.assertRaises(RuntimeError):
             controller._validate_unity_auth_bundle(poison_buf.getvalue())
+
+    def test_unity_pack_and_unpack_roundtrip_snapshots_wal_sqlite_and_clears_stale_sidecars(self):
+        import io
+        import os
+        import sqlite3
+        import stat
+        import tarfile
+
+        with tempfile.TemporaryDirectory() as src_dir, tempfile.TemporaryDirectory() as dst_dir:
+            src_home = Path(src_dir)
+            dst_home = Path(dst_dir)
+            hub = src_home / ".config/unityhub"
+            hub.mkdir(parents=True)
+            # Keep WAL uncheckpointed so the inserted row lives only in accounts.db-wal.
+            conn = sqlite3.connect(str(hub / "accounts.db"))
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA wal_autocheckpoint=0")
+            conn.execute("CREATE TABLE accounts (id TEXT PRIMARY KEY, email TEXT)")
+            conn.execute("INSERT INTO accounts VALUES ('u1', 'dev@example.com')")
+            conn.commit()
+            self.assertTrue((hub / "accounts.db-wal").is_file())
+            self.assertGreater((hub / "accounts.db-wal").stat().st_size, 0)
+
+            broker = src_home / ".local/share/UnityAuthBroker"
+            broker.mkdir(parents=True)
+            (broker / "token-store.seal").write_bytes(b"machine-bound-seal")
+            (broker / "dpop-tpm2").mkdir()
+            (broker / "dpop-tpm2/key.bin").write_bytes(b"tpm-key")
+            keyring = src_home / ".local/share/unity-keyring"
+            keyring.mkdir(parents=True)
+            (keyring / "credentials.json").write_text('{"refresh":"tok"}')
+            (keyring / "insecure-storage").write_text("plain-file mode\n")
+            (keyring / "credentials.lock").write_bytes(b"")
+
+            # Excluded files that must not be bundled.
+            (hub / "logs").mkdir()
+            (hub / "logs/cli.log").write_text("noise\n")
+            (hub / "licenses").mkdir()
+            (hub / "licenses/Unity_lic.ulf").write_text("secret-license")
+            (hub / "Editor").mkdir()
+            (hub / "Editor/blob.bin").write_bytes(b"editor")
+            (hub / "external-modules").mkdir()
+            (hub / "external-modules/mod.bin").write_bytes(b"module")
+
+            try:
+                packed = subprocess.run(
+                    [sys.executable, "-c", controller._unity_pack_script()],
+                    env={**os.environ, "HOME": str(src_home)},
+                    capture_output=True, check=True,
+                ).stdout
+            finally:
+                conn.close()
+
+            self.assertGreater(controller._validate_unity_auth_bundle(packed), 0)
+            with tarfile.open(fileobj=io.BytesIO(packed), mode="r") as tf:
+                names = set(tf.getnames())
+            self.assertIn(".config/unityhub/accounts.db", names)
+            self.assertIn(".local/share/unity-keyring/credentials.json", names)
+            self.assertIn(".local/share/unity-keyring/insecure-storage", names)
+            self.assertFalse(any(n.endswith((".db-wal", ".db-shm", ".log", ".seal", ".lock")) for n in names))
+            self.assertFalse(any("/licenses/" in n or "/Editor/" in n or "/logs/" in n
+                                 or "/external-modules/" in n or "/dpop-tpm2/" in n for n in names))
+
+            # Seed destination with a stale WAL-mode DB and stale machine seal that must be cleared on unpack.
+            dst_hub = dst_home / ".config/unityhub"
+            dst_hub.mkdir(parents=True)
+            dst_broker = dst_home / ".local/share/UnityAuthBroker"
+            dst_broker.mkdir(parents=True)
+            (dst_broker / "token-store.seal").write_bytes(b"old-seal")
+            stale = sqlite3.connect(str(dst_hub / "accounts.db"))
+            stale.execute("PRAGMA journal_mode=WAL")
+            stale.execute("PRAGMA wal_autocheckpoint=0")
+            stale.execute("CREATE TABLE accounts (id TEXT PRIMARY KEY, email TEXT)")
+            stale.execute("INSERT INTO accounts VALUES ('stale', 'old@example.com')")
+            stale.commit()
+            stale.close()
+            (dst_hub / "accounts.db-wal").write_bytes(b"stale-wal-garbage")
+            (dst_hub / "accounts.db-shm").write_bytes(b"stale-shm-garbage")
+
+            subprocess.run(
+                [sys.executable, "-c", controller._unity_unpack_script()],
+                input=packed,
+                env={**os.environ, "HOME": str(dst_home)},
+                check=True,
+            )
+
+            self.assertFalse((dst_hub / "accounts.db-wal").exists())
+            self.assertFalse((dst_hub / "accounts.db-shm").exists())
+            self.assertFalse((dst_broker / "token-store.seal").exists())
+            self.assertEqual(stat.S_IMODE((dst_hub / "accounts.db").stat().st_mode), 0o600)
+            self.assertEqual((dst_home / ".local/share/unity-keyring/credentials.json").read_text(), '{"refresh":"tok"}')
+
+            check_conn = sqlite3.connect(str(dst_hub / "accounts.db"))
+            try:
+                rows = check_conn.execute("SELECT id, email FROM accounts").fetchall()
+            finally:
+                check_conn.close()
+            self.assertEqual(rows, [("u1", "dev@example.com")])
+
+    def test_authorize_unity_replay_error_includes_unity_auth_status_output(self):
+        import io
+        import tarfile
+
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tf:
+            info = tarfile.TarInfo(".config/unityhub/accounts.db")
+            payload = b"dummy"
+            info.size = len(payload)
+            tf.addfile(info, io.BytesIO(payload))
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            (state / "unity").mkdir(parents=True)
+            (state / "unity/auth-bundle.tar").write_bytes(buf.getvalue())
+            machine = Instance(id="i-1", name="dev", state="running", public_ip="1.2.3.4",
+                               instance_type="e5-2c-8g", provider="oci",
+                               tags={"LeaseExpiresAt": "2099-01-01T00:00:00+00:00"})
+            from coder_workspace.providers import Provider
+            prov = Mock(spec=Provider)
+            prov.name = "oci"
+            prov.find_instance.return_value = machine
+            prov.get_instance.return_value = machine
+            lease_release = subprocess.CompletedProcess(
+                [], 0, stdout=json.dumps({"until": 1300, "remaining": 300.0}), stderr="")
+            def fake_remote(_machine, cmd, **_kwargs):
+                if cmd[:3] == ["sudo", "/usr/local/bin/workspace-lease", "release"]:
+                    return lease_release
+                return subprocess.CompletedProcess([], 0, stdout="", stderr="")
+            def fake_subproc(cmd, **_kwargs):
+                if "unity auth status" in cmd[-1]:
+                    return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="token decryption failed")
+                return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+            with patch.object(controller, "STATE", state), \
+                 patch.object(controller, "api", return_value={"id": "owner-1"}), \
+                 patch.object(controller, "ensure_controller_ssh"), \
+                 patch.object(controller, "renew"), \
+                 patch.object(controller, "remote", side_effect=fake_remote), \
+                 patch.object(controller.subprocess, "run", side_effect=fake_subproc):
+                with self.assertRaisesRegex(RuntimeError, "token decryption failed"):
+                    controller.authorize_unity(prov, "dev", login=False)
+
+    def test_authorize_unity_return_clears_session_on_personal_non_returnable_and_preserves_on_other_errors(self):
+        machine = Instance(id="i-1", name="dev", state="running", public_ip="1.2.3.4",
+                           instance_type="e5-2c-8g", provider="oci",
+                           tags={"LeaseExpiresAt": "2099-01-01T00:00:00+00:00"})
+        from coder_workspace.providers import Provider
+        prov = Mock(spec=Provider)
+        prov.name = "oci"
+        prov.find_instance.return_value = machine
+        prov.get_instance.return_value = machine
+        lease_release = subprocess.CompletedProcess(
+            [], 0, stdout=json.dumps({"until": 1300, "remaining": 300.0}), stderr="")
+
+        def fake_remote(_machine, cmd, **_kwargs):
+            if cmd[:3] == ["sudo", "/usr/local/bin/workspace-lease", "release"]:
+                return lease_release
+            return subprocess.CompletedProcess([], 0, stdout="", stderr="")
+
+        personal_err = subprocess.CompletedProcess(
+            [], 6, stdout="",
+            stderr="Error: Unable to return one or more licenses. Some licenses, such as free Personal licenses, can't be returned.",
+        )
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(controller, "STATE", Path(directory)), \
+             patch.object(controller, "api", return_value={"id": "owner-1"}), \
+             patch.object(controller, "ensure_controller_ssh"), \
+             patch.object(controller, "renew"), \
+             patch.object(controller, "remote", side_effect=fake_remote) as remote_mock, \
+             patch.object(controller.subprocess, "run", return_value=personal_err):
+            controller.authorize_unity(prov, "dev", return_license=True)
+        self.assertTrue(any("rm -rf ~/.config/unity*" in " ".join(c.args[1]) for c in remote_mock.call_args_list))
+
+        network_err = subprocess.CompletedProcess([], 6, stdout="", stderr="Error: network timeout")
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(controller, "STATE", Path(directory)), \
+             patch.object(controller, "api", return_value={"id": "owner-1"}), \
+             patch.object(controller, "ensure_controller_ssh"), \
+             patch.object(controller, "renew"), \
+             patch.object(controller, "remote", side_effect=fake_remote) as remote_mock, \
+             patch.object(controller.subprocess, "run", return_value=network_err):
+            with self.assertRaisesRegex(RuntimeError, "network timeout"):
+                controller.authorize_unity(prov, "dev", return_license=True)
+        self.assertFalse(any("rm -rf ~/.config/unity*" in " ".join(c.args[1]) for c in remote_mock.call_args_list))
 
     def test_load_spec_rejects_symlink_setup_script_inside_tree(self):
         with tempfile.TemporaryDirectory() as directory:
