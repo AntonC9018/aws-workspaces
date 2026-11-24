@@ -274,6 +274,181 @@ class ControllerTests(unittest.TestCase):
             code = controller.wait_for_job(prov, "smoke", machine, job_id="coder-job-1.service", poll=1)
         self.assertEqual(code, 0)
 
+    def test_reconcile_dropped_bridge_uses_lightweight_reconnect_without_touching_leases(self):
+        from coder_workspace.providers import Provider
+        prov = Mock(spec=Provider)
+        prov.name = "oci"
+        prov.template_name = "oci-private"
+        machine = inst(state="running", provider="oci")
+        prov.find_instance.return_value = machine
+        prov.list_instances.return_value = []
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            (state / "dashboard-builds.json").write_text(json.dumps({
+                "workspace-1": {"build": "build-1", "instance": machine.id, "provider": "oci"},
+            }))
+            with patch.object(controller, "STATE", state), \
+                    patch.object(controller, "api", side_effect=[
+                        {"workspaces": [workspace(template="oci-private")]}, {"id": "owner-1"},
+                    ]), \
+                    patch.object(controller, "bridge_state", return_value="inactive"), \
+                    patch.object(controller, "connect") as connect_mock, \
+                    patch.object(controller, "reconnect_bridge") as reconnect_mock, \
+                    patch.object(controller, "renew") as renew_mock, \
+                    patch.object(controller, "repair_bootstrap") as repair_mock:
+                controller.reconcile(self.settings, providers=[prov])
+            connect_mock.assert_not_called()
+            reconnect_mock.assert_called_once_with(prov, machine)
+            renew_mock.assert_not_called()
+            repair_mock.assert_not_called()
+
+    def test_reconnect_bridge_respects_activating_restart_unless_ip_changed(self):
+        prov = Mock()
+        machine = inst(state="running")
+        with patch.object(controller, "ensure_controller_ssh", return_value=False), \
+                patch.object(controller, "bridge_state", return_value="activating"), \
+                patch.object(controller, "start_bridge") as start_mock, \
+                patch.object(controller, "renew") as renew_mock:
+            controller.reconnect_bridge(prov, machine)
+        start_mock.assert_not_called()
+        renew_mock.assert_not_called()
+        with patch.object(controller, "ensure_controller_ssh", return_value=True), \
+                patch.object(controller, "bridge_state", return_value="activating"), \
+                patch.object(controller, "start_bridge") as start_mock:
+            controller.reconnect_bridge(prov, machine)
+        start_mock.assert_called_once_with(machine)
+
+    def test_connect_does_not_renew_cloud_lease_when_ssh_times_out(self):
+        prov = Mock()
+        prov.name = "oci"
+        machine = inst(state="running", provider="oci")
+        prov.find_instance.return_value = machine
+        prov.get_instance.return_value = machine
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(controller, "STATE", Path(directory)), \
+                patch.object(controller, "api", return_value={"id": "owner-1"}), \
+                patch.object(controller, "ensure_controller_ssh", return_value=False), \
+                patch.object(controller, "start_bridge"), \
+                patch.object(controller, "renew") as renew_mock, \
+                patch.object(controller.subprocess, "run", return_value=Mock(returncode=255, stdout="", stderr="Connection timed out")), \
+                patch.object(controller.time, "sleep"):
+            with self.assertRaises(RuntimeError):
+                controller.connect(prov, "smoke", wait_timeout=1)
+        renew_mock.assert_not_called()
+
+    def test_connect_releases_boot_lease_to_five_minutes_or_preserves_longer_hold(self):
+        for remaining, expected_renew in ((300.0, 300), (2400.0, 2400)):
+            with self.subTest(remaining=remaining):
+                prov = Mock()
+                prov.name = "oci"
+                machine = inst(state="running", provider="oci")
+                prov.find_instance.return_value = machine
+                lease_json = json.dumps({"until": 1000 + remaining, "remaining": remaining, "idle_until": 1300, "leases": {}})
+                with tempfile.TemporaryDirectory() as directory, \
+                        patch.object(controller, "STATE", Path(directory)), \
+                        patch.object(controller, "api", return_value={"id": "owner-1"}), \
+                        patch.object(controller, "ensure_controller_ssh", return_value=False), \
+                        patch.object(controller, "start_bridge"), \
+                        patch.object(controller, "active_jobs", return_value=[]), \
+                        patch.object(controller, "repair_bootstrap"), \
+                        patch.object(controller, "remember_bridge"), \
+                        patch.object(controller, "remote", return_value=Mock(stdout=lease_json)) as remote_mock, \
+                        patch.object(controller, "renew") as renew_mock, \
+                        patch.object(controller.subprocess, "run", return_value=Mock(returncode=0, stdout="", stderr="")):
+                    controller.connect(prov, "smoke", wait_timeout=5)
+                remote_mock.assert_called_once_with(
+                    machine, ["sudo", "/usr/local/bin/workspace-lease", "release", "--owner", "boot", "--json"],
+                    capture_output=True,
+                )
+                renew_mock.assert_called_once_with(prov, machine, expected_renew, preserve=False)
+
+    def test_guest_lease_upgrades_helpers_once_on_legacy_argparse_error(self):
+        import subprocess
+        prov = Mock()
+        prov.template_env_var = "CODER_OCI_TEMPLATE"
+        machine = inst(state="running", provider="oci")
+        err = subprocess.CalledProcessError(2, ["ssh"])
+        ok = Mock(stdout=json.dumps({"until": 1300, "remaining": 300.0}))
+        with patch.object(controller, "remote", side_effect=[err, ok]) as remote_mock, \
+                patch.object(controller, "install_worker_helpers", return_value=True) as upgrade_mock:
+            result = controller.guest_lease(prov, machine, ["release", "--owner", "boot"], capture_json=True)
+        upgrade_mock.assert_called_once_with(prov, machine)
+        self.assertEqual(remote_mock.call_count, 2)
+        self.assertEqual(result["remaining"], 300.0)
+
+    def test_active_jobs_includes_activating_and_deactivating_by_default(self):
+        machine = inst(state="running")
+        with patch.object(controller, "remote", return_value=Mock(stdout="coder-job-1.service loaded deactivating\n")) as remote_mock:
+            jobs = controller.active_jobs(machine)
+            self.assertEqual(jobs, ["coder-job-1.service"])
+            self.assertIn("--state=activating,running,deactivating", remote_mock.call_args.args[1])
+            controller.active_jobs(machine, include_deactivating=False)
+            self.assertIn("--state=activating,running", remote_mock.call_args.args[1])
+
+    def test_sync_projects_uses_scoped_lease_and_preserves_longer_hold(self):
+        prov = Mock()
+        prov.name = "oci"
+        machine = inst(state="running", provider="oci")
+        fake_lib = Mock()
+        fake_lib.pack.return_value = {"snapshot": "a" * 24, "projects": [{"name": "main"}]}
+        release_json = json.dumps({"until": 4600, "remaining": 3500.0, "idle_until": 1400, "leases": {"hold": 4600}})
+        def fake_remote(_machine, cmd, **_kwargs):
+            if cmd[:3] == ["sudo", "/usr/local/bin/workspace-lease", "release"]:
+                return Mock(stdout=release_json)
+            if cmd[:2] == ["mktemp", "-d"]:
+                return Mock(stdout="/home/ubuntu/.cache/coder-transfers/input-1\n")
+            if cmd[:2] == ["/usr/local/bin/workspace-transfer", "prepare"]:
+                return Mock(stdout=json.dumps({"main": "/home/ubuntu/projects/snapshots/" + "a" * 24 + "/main"}))
+            return Mock(stdout="")
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(controller, "STATE", Path(directory)), \
+                patch.object(controller, "transfer_library", return_value=fake_lib), \
+                patch.object(controller, "ensure_controller_ssh"), \
+                patch.object(controller, "active_jobs", return_value=[]), \
+                patch.object(controller, "renew") as renew_mock, \
+                patch.object(controller, "remote", side_effect=fake_remote) as remote_mock, \
+                patch.object(controller, "run"), \
+                patch.object(controller.subprocess, "run", return_value=Mock(returncode=0)):
+            controller.sync_projects(prov, "smoke", machine, "manifest.json")
+        lease_cmds = [c.args[1] for c in remote_mock.call_args_list if c.args[1][:2] == ["sudo", "/usr/local/bin/workspace-lease"]]
+        self.assertEqual(len(lease_cmds), 2)
+        self.assertEqual(lease_cmds[0][2:5], ["hold", "900", "--owner"])
+        self.assertTrue(lease_cmds[0][5].startswith("op:sync-"))
+        self.assertEqual(lease_cmds[1][2:5], ["release", "--owner", lease_cmds[0][5]])
+        # First renew preserves existing >= 900; release syncs cloud lease to remaining 3500s hold.
+        self.assertEqual(renew_mock.call_args_list[0].args, (prov, machine, 900))
+        self.assertEqual(renew_mock.call_args_list[0].kwargs, {"preserve": True})
+        self.assertEqual(renew_mock.call_args_list[1].args, (prov, machine, 3500))
+        self.assertEqual(renew_mock.call_args_list[1].kwargs, {"preserve": False})
+
+    def test_repair_bootstrap_installs_helpers_before_runcmd_and_scopes_legacy_boot_hold(self):
+        import gzip
+        cloud_cfg = {
+            "write_files": [
+                {"path": "/var/lib/cloud/scripts/per-boot/coder-lease", "permissions": "0755",
+                 "content": "#!/bin/sh\n/usr/local/bin/workspace-lease hold 600\n"},
+            ],
+            "runcmd": ["/usr/local/bin/workspace-lease hold 600"],
+        }
+        userdata = gzip.compress(("#cloud-config\n" + json.dumps(cloud_cfg)).encode())
+        prov = Mock()
+        prov.template_env_var = "CODER_OCI_TEMPLATE"
+        prov.read_userdata.return_value = userdata
+        machine = inst(state="running", provider="oci")
+        with tempfile.TemporaryDirectory() as directory:
+            tpl = Path(directory)
+            for filename, _ in controller.WORKER_HELPERS:
+                (tpl / filename).write_text(f"# {filename}\n")
+            with patch.dict(controller.os.environ, {"CODER_OCI_TEMPLATE": directory}), \
+                    patch.object(controller, "remote") as remote_mock:
+                controller.repair_bootstrap(prov, machine)
+        remote_mock.assert_called_once()
+        script = remote_mock.call_args.args[1][3]
+        payload = json.loads(remote_mock.call_args.kwargs["input"])
+        self.assertEqual(set(payload["helpers"].keys()), {t for _, t in controller.WORKER_HELPERS})
+        self.assertLess(script.index("for target, content in helpers.items():"), script.index('for command in config["runcmd"]:'))
+        self.assertIn("--owner boot", script)
+
 
 if __name__ == "__main__":
     unittest.main()
