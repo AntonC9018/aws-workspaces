@@ -215,14 +215,16 @@ resource "aws_instance" "workspace" {
         UNIT
       },
       { path = "/opt/coder-agent.sh", permissions = "0755", content = replace(coder_agent.dev.init_script, var.coder_url, "http://127.0.0.1:7080") },
+      { path = "/etc/systemd/system/coder-lease-boot.service", content = "[Unit]\nDescription=Grant startup workspace lease before lease timer ticks\nBefore=coder-lease.timer\n[Service]\nType=oneshot\nExecStart=/usr/local/bin/workspace-lease hold 600 --owner boot\n[Install]\nWantedBy=multi-user.target\n" },
       { path = "/etc/systemd/system/coder-lease.service", content = "[Service]\nType=oneshot\nExecStart=/usr/local/bin/workspace-lease tick\n" },
       { path = "/etc/systemd/system/coder-lease.timer", content = "[Timer]\nOnBootSec=30\nOnUnitActiveSec=15\n[Install]\nWantedBy=timers.target\n" },
-      { path = "/var/lib/cloud/scripts/per-boot/coder-lease", permissions = "0755", content = "#!/bin/sh\n/usr/local/bin/workspace-lease hold 600\n" },
+      { path = "/var/lib/cloud/scripts/per-boot/coder-lease", permissions = "0755", content = "#!/bin/sh\n/usr/local/bin/workspace-lease hold 600 --owner boot\n" },
     ]
     runcmd = [
       "mkdir -p /home/ubuntu/projects; chown ubuntu:ubuntu /home/ubuntu/projects",
-      "/usr/local/bin/workspace-lease hold 600",
+      "/usr/local/bin/workspace-lease hold 600 --owner boot",
       "systemctl daemon-reload",
+      "systemctl enable coder-lease-boot.service",
       "systemctl enable --now coder-lease.timer",
       "systemctl enable coder-workspace.service; systemctl start --no-block coder-workspace.service",
     ]

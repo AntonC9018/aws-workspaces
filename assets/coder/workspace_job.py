@@ -8,6 +8,13 @@ import subprocess
 import sys
 import time
 
+
+def write_json(path: Path, data: dict) -> None:
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_text(json.dumps(data))
+    os.replace(temp, path)
+
+
 action, job, *command = sys.argv[1:]
 result = Path.home() / ".local/state/coder-jobs" / job
 result.mkdir(parents=True, exist_ok=True)
@@ -24,13 +31,13 @@ if action == "finalize":
                   service_exit_code=os.environ.get("EXIT_CODE"),
                   service_exit_status=os.environ.get("EXIT_STATUS"))
     record.setdefault("finished", time.time())
-    record_path.write_text(json.dumps(record))
-    subprocess.run(["sudo", "/usr/local/bin/workspace-lease", "complete"], check=True)
+    write_json(record_path, record)
+    subprocess.run(["sudo", "/usr/local/bin/workspace-lease", "release", "--owner", f"job:{job}"], check=True)
     sys.exit(0)
 seconds, *command = command
 deadline_file.write_text(str(time.time() + int(seconds)))
 record = {"job": job, "command": command, "cwd": os.getcwd(), "started": time.time()}
-(result / "result.json").write_text(json.dumps(record))
+write_json(result / "result.json", record)
 status = 1
 try:
     with (result / "output.log").open("wb") as log:
@@ -48,8 +55,8 @@ try:
             time.sleep(0.25)
         status = 124 if record.get("timed_out") else process.returncode
     record.update(exit_status=status, finished=time.time())
-    (result / "result.json").write_text(json.dumps(record))
+    write_json(result / "result.json", record)
 except OSError as error:
     record.update(error=str(error), exit_status=1, finished=time.time())
-    (result / "result.json").write_text(json.dumps(record))
+    write_json(result / "result.json", record)
 sys.exit(status)

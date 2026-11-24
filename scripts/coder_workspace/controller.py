@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import fcntl
 import gzip
 import importlib.util
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -185,10 +187,152 @@ def remote(machine: Instance, command: list[str], **kwargs):
     return run(ssh_args(machine) + [shlex.join(command)], **kwargs)
 
 
-def active_jobs(machine: Instance) -> list[str]:
-    active = remote(machine, ["systemctl", "list-units", "--state=running", "--no-legend",
+DEFAULT_LEASE_SECONDS = 300
+WORKER_HELPERS = (
+    ("workspace_lease.py", "workspace-lease"),
+    ("workspace_job.py", "workspace-job"),
+    ("workspace_transfer.py", "workspace-transfer"),
+    ("github_credential.py", "workspace-github-credential"),
+)
+
+
+def active_jobs(machine: Instance, *, include_deactivating: bool = True) -> list[str]:
+    states = "activating,running,deactivating" if include_deactivating else "activating,running"
+    active = remote(machine, ["systemctl", "list-units", f"--state={states}", "--no-legend",
                               "coder-job-*.service"], capture_output=True)
     return [line.split()[0] for line in active.stdout.splitlines() if line.strip()]
+
+
+def _load_worker_helpers(provider: Provider) -> dict[str, str]:
+    helpers = {}
+    template_dir = os.environ.get(provider.template_env_var)
+    if template_dir:
+        root = Path(template_dir)
+        for filename, target in WORKER_HELPERS:
+            source = root / filename
+            if source.is_file():
+                helpers[target] = source.read_text()
+        if helpers:
+            return helpers
+    repo_root = Path(__file__).resolve().parents[2]
+    fallback_paths = {
+        "workspace-lease": repo_root / "assets/coder/workspace_lease.py",
+        "workspace-job": repo_root / "assets/coder/workspace_job.py",
+        "workspace-transfer": Path(__file__).resolve().parent / "transfer.py",
+        "workspace-github-credential": repo_root / "assets/coder/github_credential.py",
+    }
+    for target, source in fallback_paths.items():
+        if source.is_file():
+            helpers[target] = source.read_text()
+    return helpers
+
+
+def install_worker_helpers(provider: Provider, machine: Instance) -> bool:
+    helpers = _load_worker_helpers(provider)
+    if not helpers:
+        return False
+    installer = r'''
+import json, os, pathlib, sys
+for target, content in json.load(sys.stdin).items():
+    dest = pathlib.Path("/usr/local/bin") / target
+    temp = dest.with_suffix(".tmp")
+    temp.write_text(content)
+    temp.chmod(0o755)
+    os.replace(temp, dest)
+per_boot = pathlib.Path("/var/lib/cloud/scripts/per-boot/coder-lease")
+if per_boot.is_file():
+    original = per_boot.read_text()
+    patched = original.replace("/usr/local/bin/workspace-lease hold 600\n",
+                               "/usr/local/bin/workspace-lease hold 600 --owner boot\n")
+    if patched != original:
+        temp = per_boot.with_suffix(".tmp")
+        temp.write_text(patched)
+        temp.chmod(0o755)
+        os.replace(temp, per_boot)
+'''
+    remote(machine, ["sudo", "python3", "-c", installer], input=json.dumps(helpers))
+    return True
+
+
+def guest_lease(provider: Provider, machine: Instance, lease_args: list[str],
+                *, capture_json: bool = False) -> dict | None:
+    cmd = ["sudo", "/usr/local/bin/workspace-lease", *lease_args]
+    if capture_json:
+        cmd.append("--json")
+    try:
+        res = remote(machine, cmd, capture_output=True)
+    except subprocess.CalledProcessError as error:
+        if error.returncode == 2 and install_worker_helpers(provider, machine):
+            res = remote(machine, cmd, capture_output=True)
+        else:
+            raise
+    if not capture_json:
+        return None
+    raw = getattr(res, "stdout", None)
+    if isinstance(raw, str) and raw.strip().startswith("{"):
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
+def acquire_lease(provider: Provider, machine: Instance, seconds: int, *, owner: str) -> None:
+    renew(provider, machine, seconds, preserve=True)
+    guest_lease(provider, machine, ["hold", str(seconds), "--owner", owner])
+
+
+def sync_cloud_lease_from_guest(provider: Provider, machine: Instance, remaining: float) -> None:
+    """Shorten or preserve the cloud deadline from guest state without letting the guest extend it."""
+    provider.assert_guard(instance_type=machine.tags.get("InstanceSize") or None)
+    now = dt.datetime.now(dt.timezone.utc)
+    floor = now + dt.timedelta(seconds=DEFAULT_LEASE_SECONDS + 60)
+    desired = now + dt.timedelta(seconds=max(DEFAULT_LEASE_SECONDS, math.ceil(remaining)) + 60)
+    latest = provider.get_instance(machine.id)
+    existing = latest.lease_expires_at if isinstance(latest, Instance) else None
+    cap = max(existing, floor) if existing is not None else floor
+    deadline = min(cap, desired)
+    provider.set_tags(machine, {"LeaseExpiresAt": deadline.isoformat(), "StoppedSince": ""})
+
+
+def release_lease(provider: Provider, machine: Instance, *, owner: str) -> None:
+    state = guest_lease(provider, machine, ["release", "--owner", owner], capture_json=True)
+    if isinstance(state, dict) and isinstance(state.get("remaining"), (int, float)):
+        sync_cloud_lease_from_guest(provider, machine, float(state["remaining"]))
+    else:
+        renew(provider, machine, DEFAULT_LEASE_SECONDS, preserve=True)
+
+
+@contextlib.contextmanager
+def scoped_lease(provider: Provider, machine: Instance, seconds: int, owner: str):
+    acquire_lease(provider, machine, seconds, owner=owner)
+    failed = False
+    try:
+        yield
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        try:
+            release_lease(provider, machine, owner=owner)
+        except Exception as error:
+            if not failed:
+                print(f"warning: could not release temporary lease {owner} on {machine.name}: {error}",
+                      file=sys.stderr)
+
+
+BOOT_LEASE_UNIT = (
+    "[Unit]\n"
+    "Description=Grant startup workspace lease before lease timer ticks\n"
+    "Before=coder-lease.timer\n"
+    "[Service]\n"
+    "Type=oneshot\n"
+    "ExecStart=/usr/local/bin/workspace-lease hold 600 --owner boot\n"
+    "[Install]\n"
+    "WantedBy=multi-user.target\n"
+)
 
 
 def repair_bootstrap(provider: Provider, machine: Instance) -> None:
@@ -197,74 +341,138 @@ def repair_bootstrap(provider: Provider, machine: Instance) -> None:
     if raw.startswith(b"\x1f\x8b"):
         raw = gzip.decompress(raw)
     config = json.loads(raw.decode().split("\n", 1)[1])
+    helpers = _load_worker_helpers(provider)
+    if "workspace-lease" not in helpers or "workspace-job" not in helpers:
+        raise RuntimeError(f"Could not load runtime helpers for {provider.name} (check {provider.template_env_var})")
     repair = r'''
 import json, os, pathlib, pwd, grp, subprocess, sys
-config = json.load(sys.stdin)
+payload = json.load(sys.stdin)
+config = payload["config"]
+helpers = payload["helpers"]
+boot_unit = payload["boot_unit"]
 user = pwd.getpwnam("ubuntu")
 os.chown(user.pw_dir, user.pw_uid, user.pw_gid)
+for target, content in helpers.items():
+    dest = pathlib.Path("/usr/local/bin") / target
+    temp = dest.with_suffix(".tmp")
+    temp.write_text(content)
+    temp.chmod(0o755)
+    os.replace(temp, dest)
+helper_paths = {str(pathlib.Path("/usr/local/bin") / target) for target in helpers}
 for item in config["write_files"]:
     path = pathlib.Path(item["path"])
+    if str(path) in helper_paths:
+        continue
+    content = item["content"]
+    if str(path) == "/var/lib/cloud/scripts/per-boot/coder-lease":
+        content = content.replace("/usr/local/bin/workspace-lease hold 600\n",
+                                  "/usr/local/bin/workspace-lease hold 600 --owner boot\n")
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(item["content"])
-    path.chmod(int(item.get("permissions", "0644"), 8))
+    temp = path.with_name(path.name + ".tmp")
+    temp.write_text(content)
+    temp.chmod(int(item.get("permissions", "0644"), 8))
     if "owner" in item:
-        user, group = item["owner"].split(":")
-        os.chown(path, pwd.getpwnam(user).pw_uid, grp.getgrnam(group).gr_gid)
+        owner_user, owner_group = item["owner"].split(":")
+        os.chown(temp, pwd.getpwnam(owner_user).pw_uid, grp.getgrnam(owner_group).gr_gid)
+    os.replace(temp, path)
+boot_unit_path = pathlib.Path("/etc/systemd/system/coder-lease-boot.service")
+temp = boot_unit_path.with_suffix(".tmp")
+temp.write_text(boot_unit)
+temp.chmod(0o644)
+os.replace(temp, boot_unit_path)
 for command in config["runcmd"]:
+    if command.strip() == "/usr/local/bin/workspace-lease hold 600":
+        command = "/usr/local/bin/workspace-lease hold 600 --owner boot"
     subprocess.run(command, shell=True, check=True)
+subprocess.run(["systemctl", "daemon-reload"], check=True)
+subprocess.run(["systemctl", "enable", "coder-lease-boot.service"], check=True)
 '''
-    remote(machine, ["sudo", "python3", "-c", repair], input=json.dumps(config))
-    template_root = Path(os.environ[provider.template_env_var])
-    for filename, target in (("workspace_lease.py", "workspace-lease"), ("workspace_job.py", "workspace-job"),
-                             ("workspace_transfer.py", "workspace-transfer"),
-                             ("github_credential.py", "workspace-github-credential")):
-        source = template_root / filename
-        remote(machine, ["sudo", "tee", "/usr/local/bin/" + target],
-               input=source.read_text(), stdout=subprocess.DEVNULL)
-        remote(machine, ["sudo", "chmod", "0755", "/usr/local/bin/" + target])
+    remote(machine, ["sudo", "python3", "-c", repair],
+           input=json.dumps({"config": config, "helpers": helpers, "boot_unit": BOOT_LEASE_UNIT}))
 
 
-def ensure_controller_ssh(provider: Provider, machine: Instance) -> None:
+def ensure_controller_ssh(provider: Provider, machine: Instance) -> bool:
     try:
         cidr = current_ipv4_cidr()
     except Exception:
-        return
+        return False
     if provider.ensure_ssh_access(machine, cidr):
         print(f"{machine.name}: updated SSH firewall rule for controller IP {cidr}", flush=True)
+        return True
+    return False
 
 
-def connect(provider: Provider, name: str) -> Instance:
+def bridge_target_ip(instance_id: str) -> str | None:
+    res = subprocess.run(
+        ["systemctl", "--user", "show", "-p", "Description", "--value", bridge_unit(instance_id)],
+        capture_output=True, text=True,
+    )
+    if res.returncode != 0 or not isinstance(res.stdout, str):
+        return None
+    parts = res.stdout.strip().split()
+    if len(parts) == 4 and parts[0] == "Coder" and parts[1] == "bridge" and parts[2] == instance_id:
+        return parts[3]
+    return None
+
+
+def bridge_matches_ip(machine: Instance) -> bool:
+    return bool(machine.public_ip) and bridge_target_ip(machine.id) == machine.public_ip
+
+
+def start_bridge(machine: Instance) -> None:
+    unit = bridge_unit(machine.id)
+    subprocess.run(["systemctl", "--user", "stop", unit], capture_output=True)
+    run(["systemd-run", "--user", "--quiet", "--collect", "--unit", unit,
+         "--description", f"Coder bridge {machine.id} {machine.public_ip}",
+         "--property", "Restart=on-failure", "--property", "RestartSec=5",
+         *ssh_args(machine)[:-1], "-NT", "-o", "ExitOnForwardFailure=yes", "-R",
+         "127.0.0.1:7080:127.0.0.1:7080", ssh_args(machine)[-1]])
+
+
+def reconnect_bridge(provider: Provider, machine: Instance) -> None:
+    """Restore a dropped or stale-IP SSH bridge without touching leases or running bootstrap repair."""
+    ip_updated = ensure_controller_ssh(provider, machine)
+    state = bridge_state({"instance": machine.id})
+    if state in ("active", "activating") and not ip_updated and bridge_matches_ip(machine):
+        return
+    start_bridge(machine)
+
+
+CLOUD_INIT_READY_PROBE = (
+    "test -f /var/lib/cloud/instance/boot-finished "
+    "|| (command -v cloud-init >/dev/null && cloud-init status 2>/dev/null "
+    "| grep -Eq 'status: (done|error|degraded|disabled)')"
+)
+
+
+def connect(provider: Provider, name: str, *, wait_timeout: int = 240, restart_bridge: bool = True) -> Instance:
     owner = api("users/me")["id"]
     machine = provider.find_instance(name, owner)
     if machine.state != "running":
         raise RuntimeError(f"Workspace is {machine.state}; use coder-{provider.name} resume first")
-    ensure_controller_ssh(provider, machine)
-    renew(provider, machine, 600)
+    ip_updated = ensure_controller_ssh(provider, machine)
     unit = bridge_unit(machine.id)
-    subprocess.run(["systemctl", "--user", "stop", unit], capture_output=True)
-    run(["systemd-run", "--user", "--quiet", "--collect", "--unit", unit,
-         "--property", "Restart=on-failure", "--property", "RestartSec=5"] +
-        ssh_args(machine)[:-1] + ["-NT", "-o", "ExitOnForwardFailure=yes", "-R",
-                                  "127.0.0.1:7080:127.0.0.1:7080", ssh_args(machine)[-1]])
-    deadline = time.monotonic() + 240
+    if (restart_bridge or ip_updated or bridge_state({"instance": machine.id}) == "inactive"
+            or not bridge_matches_ip(machine)):
+        start_bridge(machine)
+    deadline = time.monotonic() + wait_timeout
     last_probe = ""
-    for attempt in range(90):
-        if time.monotonic() >= deadline:
+    for attempt in range(max(1, math.ceil(wait_timeout / 3) + 1)):
+        if attempt > 0 and time.monotonic() >= deadline:
             break
-        readiness = ("if test -x /usr/local/bin/workspace-lease; then sudo /usr/local/bin/workspace-lease hold 600; fi; "
-                     "test -f /var/lib/cloud/instance/boot-finished")
-        ready = subprocess.run(ssh_args(machine) + [readiness], capture_output=True, text=True)
+        ready = subprocess.run(
+            [*ssh_args(machine), CLOUD_INIT_READY_PROBE],
+            capture_output=True, text=True,
+        )
         if ready.returncode == 0:
             if active_jobs(machine):
                 remember_bridge(name, machine)
                 print(f"{name}: bridge restored; preserving the active job without bootstrap changes")
                 return machine
             repair_bootstrap(provider, machine)
-            # Never shorten leases here: reconcile reconnects in the background and can race a
-            # `run`, `authorize-unity`, or `hold` that has just extended them.
-            renew(provider, machine, 300)
+            release_lease(provider, machine, owner="boot")
             remember_bridge(name, machine)
-            print(f"{name}: private Coder bridge ready; existing leases preserved")
+            print(f"{name}: private Coder bridge ready; default idle lease is five minutes")
             return machine
         detail = (ready.stderr or ready.stdout or "").strip().splitlines()
         last_probe = f"exit {ready.returncode}" + (f": {detail[-1]}" if detail else "")
@@ -273,7 +481,9 @@ def connect(provider: Provider, name: str) -> Instance:
             if state != "running":
                 subprocess.run(["systemctl", "--user", "stop", unit], capture_output=True)
                 raise RuntimeError("Workspace stopped while reconnecting; resume it before retrying")
-        time.sleep(3)
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(min(3, max(0.0, deadline - time.monotonic())))
     raise RuntimeError(f"SSH/bootstrap did not become ready within its bounded startup allowance ({last_probe})")
 
 
@@ -293,7 +503,11 @@ def save_bridge_records(updates: dict, *, remove: list[str] | None = None) -> No
 def remember_bridge(name: str, machine: Instance) -> None:
     workspace = api("users/me/workspace/" + name)
     save_bridge_records({workspace["id"]: {
-        "build": workspace["latest_build"]["id"], "instance": machine.id, "provider": machine.provider}})
+        "build": workspace["latest_build"]["id"],
+        "instance": machine.id,
+        "provider": machine.provider,
+        "public_ip": machine.public_ip,
+    }})
 
 
 def should_connect(workspace: dict, previous: dict, bridge_alive: bool = True,
@@ -357,13 +571,12 @@ def authorize_repository(provider: Provider, name: str, repo: str, *, write: boo
         raise RuntimeError("Resume the worker before authorizing a repository")
     ensure_controller_ssh(provider, machine)
     credential = github.mint(STATE / "github", repo, write=write)
-    renew(provider, machine, 300)
-    remote(machine, ["sudo", "/usr/local/bin/workspace-lease", "hold", "300"])
-    source = Path(os.environ["CODER_AWS_GITHUB_HELPER"])
-    remote(machine, ["sudo", "tee", "/usr/local/bin/workspace-github-credential"],
-           input=source.read_text(), stdout=subprocess.DEVNULL)
-    remote(machine, ["sudo", "chmod", "0755", "/usr/local/bin/workspace-github-credential"])
-    install = """
+    with scoped_lease(provider, machine, 300, f"op:auth-{uuid.uuid4().hex[:8]}"):
+        source = Path(os.environ["CODER_AWS_GITHUB_HELPER"])
+        remote(machine, ["sudo", "tee", "/usr/local/bin/workspace-github-credential"],
+               input=source.read_text(), stdout=subprocess.DEVNULL)
+        remote(machine, ["sudo", "chmod", "0755", "/usr/local/bin/workspace-github-credential"])
+        install = """
 import hashlib, json, os, pathlib, subprocess, sys
 os.umask(0o077)
 value = json.load(sys.stdin)
@@ -377,8 +590,8 @@ subprocess.run(["git", "config", "--global", "credential.https://github.com.help
                 "/usr/local/bin/workspace-github-credential"], check=True)
 subprocess.run(["git", "config", "--global", "credential.https://github.com.useHttpPath", "true"], check=True)
 """
-    remote(machine, ["python3", "-c", install], input=json.dumps({"repo": repo, "credential": {
-        "token": credential["token"], "expires_at": credential["expires_at"]}}))
+        remote(machine, ["python3", "-c", install], input=json.dumps({"repo": repo, "credential": {
+            "token": credential["token"], "expires_at": credential["expires_at"]}}))
     print(f"{name}: {repo} HTTPS authorization ({'write' if write else 'read-only'}), expires {credential['expires_at']}")
 
 
@@ -422,8 +635,17 @@ def authorize_unity(provider: Provider, name: str, *, license_path: str | None =
         raise RuntimeError("Resume the worker before configuring Unity licensing")
     ensure_controller_ssh(provider, machine)
     lease = 600 if login else 300
-    renew(provider, machine, lease)
-    remote(machine, ["sudo", "/usr/local/bin/workspace-lease", "hold", str(lease)])
+    with scoped_lease(provider, machine, lease, f"op:unity-{uuid.uuid4().hex[:8]}"):
+        _run_authorize_unity(
+            provider, name, machine, license_path=license_path,
+            create_alf=create_alf, alf_out=alf_out, login=login, return_license=return_license,
+        )
+
+
+def _run_authorize_unity(provider: Provider, name: str, machine: Instance, *,
+                         license_path: str | None = None, create_alf: bool = False,
+                         alf_out: str | None = None, login: bool = False,
+                         return_license: bool = False) -> None:
     unity_dir = STATE / "unity"
     unity_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     unity_dir.chmod(0o700)
@@ -644,8 +866,7 @@ def bake_image(provider: Provider, settings: dict, *, spec_path: str,
                 tail = "\n".join(log.read_text(errors="replace").splitlines()[-20:])
                 raise RuntimeError(f"Builder creation failed; see {log}\n{tail}")
             machine = connect(provider, builder)
-            renew(provider, machine, timeout + 600)
-            remote(machine, ["sudo", "/usr/local/bin/workspace-lease", "hold", str(timeout + 600)])
+            acquire_lease(provider, machine, timeout + 600, owner="op:bake")
             if spec["packages"]:
                 print(f"Installing {len(spec['packages'])} apt packages...", flush=True)
                 remote(machine, ["sudo", "env", "DEBIAN_FRONTEND=noninteractive", "apt-get",
@@ -666,10 +887,11 @@ def bake_image(provider: Provider, settings: dict, *, spec_path: str,
             # Sanitize builder state, lease units, host keys, logs, and credentials before snapshotting.
             sanitize = (
                 "set -e; "
-                "sudo systemctl disable --now coder-workspace.service coder-lease.timer "
+                "sudo systemctl disable --now coder-workspace.service coder-lease-boot.service coder-lease.timer "
                 "apt-daily.timer apt-daily-upgrade.timer || true; "
-                "sudo rm -rf /etc/systemd/system/coder-workspace.service /etc/systemd/system/coder-lease.service "
-                "/etc/systemd/system/coder-lease.timer /var/lib/cloud/scripts/per-boot/coder-lease "
+                "sudo rm -rf /etc/systemd/system/coder-workspace.service /etc/systemd/system/coder-lease-boot.service "
+                "/etc/systemd/system/coder-lease.service /etc/systemd/system/coder-lease.timer "
+                "/var/lib/cloud/scripts/per-boot/coder-lease "
                 "/opt/coder-agent.sh /var/lib/coder-workspace/lease.json /var/lib/coder-workspace/lease.lock "
                 "/home/ubuntu/.config/coder-github /home/ubuntu/.config/unity* /home/ubuntu/.local/share/unity* "
                 "/home/ubuntu/.config/Unity /home/ubuntu/.local/share/Unity /home/ubuntu/.unity "
@@ -738,38 +960,33 @@ def sync_projects(provider: Provider, name: str, machine: Instance, manifest: st
     ensure_controller_ssh(provider, machine)
     if active_jobs(machine):
         raise RuntimeError("Wait for the running job before syncing another source snapshot")
-    renew(provider, machine, 900)
-    remote(machine, ["sudo", "/usr/local/bin/workspace-lease", "hold", "900"])
     ready = subprocess.run(ssh_args(machine) + ["test -x /usr/local/bin/workspace-transfer"], capture_output=True)
     if ready.returncode:
         connect(provider, name)
-        renew(provider, machine, 900)
-        remote(machine, ["sudo", "/usr/local/bin/workspace-lease", "hold", "900"])
-    with tempfile.TemporaryDirectory(prefix="transfer-", dir=STATE) as temporary:
-        inputs = Path(temporary) / "input"
-        plan = lib.pack(manifest, inputs)
-        print(json.dumps(plan, indent=2), flush=True)
-        remote(machine, ["mkdir", "-p", "/home/ubuntu/.cache/coder-transfers"])
-        stage = remote(machine, ["mktemp", "-d", "/home/ubuntu/.cache/coder-transfers/input-XXXXXXXX"],
-                       capture_output=True).stdout.strip()
-        try:
-            run(["rsync", "-azs", "-e", shlex.join(ssh_args(machine)[:-1]), str(inputs) + "/",
-                 ssh_args(machine)[-1] + ":" + stage + "/"])
-            directories = json.loads(remote(machine, ["/usr/local/bin/workspace-transfer", "prepare", stage],
-                                            capture_output=True).stdout)
-        finally:
-            remote(machine, ["/usr/local/bin/workspace-transfer", "cleanup", stage])
-    records = STATE / "manifests"
-    records.mkdir(exist_ok=True)
-    temp = records / (name + ".tmp")
-    temp.write_text(json.dumps({"manifest": plan, "projects": directories, "instance_id": machine.id}, indent=2))
-    os.replace(temp, records / (name + ".json"))
-    provider.set_tags(machine, {
-        "SourceSnapshot": plan["snapshot"],
-        "SourceProjects": str(len(plan["projects"])),
-    })
-    remote(machine, ["sudo", "/usr/local/bin/workspace-lease", "complete"])
-    renew(provider, machine, 300, preserve=False)
+    with scoped_lease(provider, machine, 900, f"op:sync-{uuid.uuid4().hex[:8]}"):
+        with tempfile.TemporaryDirectory(prefix="transfer-", dir=STATE) as temporary:
+            inputs = Path(temporary) / "input"
+            plan = lib.pack(manifest, inputs)
+            print(json.dumps(plan, indent=2), flush=True)
+            remote(machine, ["mkdir", "-p", "/home/ubuntu/.cache/coder-transfers"])
+            stage = remote(machine, ["mktemp", "-d", "/home/ubuntu/.cache/coder-transfers/input-XXXXXXXX"],
+                           capture_output=True).stdout.strip()
+            try:
+                run(["rsync", "-azs", "-e", shlex.join(ssh_args(machine)[:-1]), str(inputs) + "/",
+                     ssh_args(machine)[-1] + ":" + stage + "/"])
+                directories = json.loads(remote(machine, ["/usr/local/bin/workspace-transfer", "prepare", stage],
+                                                capture_output=True).stdout)
+            finally:
+                remote(machine, ["/usr/local/bin/workspace-transfer", "cleanup", stage])
+        records = STATE / "manifests"
+        records.mkdir(exist_ok=True)
+        temp = records / (name + ".tmp")
+        temp.write_text(json.dumps({"manifest": plan, "projects": directories, "instance_id": machine.id}, indent=2))
+        os.replace(temp, records / (name + ".json"))
+        provider.set_tags(machine, {
+            "SourceSnapshot": plan["snapshot"],
+            "SourceProjects": str(len(plan["projects"])),
+        })
     print("Prepared projects: " + json.dumps(directories), flush=True)
 
 
@@ -1043,10 +1260,22 @@ def gc_workspaces(providers: list[Provider], settings: dict, *,
     return {"stopped": stopped, "marked": marked, "deleted": deleted, "dry_run": dry_run}
 
 
+def bridge_state(record: dict) -> str:
+    if not record.get("instance"):
+        return "inactive"
+    res = subprocess.run(
+        ["systemctl", "--user", "is-active", bridge_unit(record["instance"])],
+        capture_output=True, text=True,
+    )
+    if res.returncode == 0:
+        return "active"
+    if isinstance(res.stdout, str) and res.stdout.strip() == "activating":
+        return "activating"
+    return "inactive"
+
+
 def bridge_running(record: dict) -> bool:
-    return bool(record.get("instance")) and subprocess.run(
-        ["systemctl", "--user", "is-active", "--quiet", bridge_unit(record["instance"])],
-        capture_output=True).returncode == 0
+    return bridge_state(record) == "active"
 
 
 def configured_providers(settings: dict) -> list[Provider]:
@@ -1061,7 +1290,6 @@ def reconcile(settings: dict, providers: list[Provider] | None = None) -> None:
     """Connect each successful dashboard start once, enforce OCI leases, and prune stale stopped workers."""
     registry_path = STATE / "dashboard-builds.json"
     registry = json.loads(registry_path.read_text()) if registry_path.exists() else {}
-    updates = {}
     active_providers = providers if providers is not None else configured_providers(settings)
     by_template = {p.template_name: p for p in active_providers}
     workspaces = api("workspaces?q=owner%3Ame")["workspaces"]
@@ -1083,10 +1311,12 @@ def reconcile(settings: dict, providers: list[Provider] | None = None) -> None:
                             continue
                         latest = json.loads(registry_path.read_text()) if registry_path.exists() else {}
                         current = latest.get(workspace["id"], {})
-                        if current.get("build") == build["id"] and bridge_running(current):
+                        is_new_build = current.get("build") != build["id"]
+                        if not is_new_build and bridge_running(current):
                             continue
                         machine = prov.find_instance(workspace["name"], owner)
                         if machine.state != "running":
+                            subprocess.run(["systemctl", "--user", "stop", bridge_unit(machine.id)], capture_output=True)
                             continue
                         try:
                             prov.assert_guard(instance_type=machine.tags.get("InstanceSize") or None)
@@ -1094,17 +1324,24 @@ def reconcile(settings: dict, providers: list[Provider] | None = None) -> None:
                             print(f"warning: stopping guarded {prov.name} workspace {workspace['name']}: {guard_err}",
                                   file=sys.stderr)
                             prov.stop_instance(machine)
+                            subprocess.run(["systemctl", "--user", "stop", bridge_unit(machine.id)], capture_output=True)
                             continue
-                        connect(prov, workspace["name"])
-                        updates[workspace["id"]] = {"build": build["id"], "instance": machine.id, "provider": prov.name}
+                        if is_new_build:
+                            connect(prov, workspace["name"], wait_timeout=15, restart_bridge=False)
+                            save_bridge_records({workspace["id"]: {
+                                "build": build["id"],
+                                "instance": machine.id,
+                                "provider": prov.name,
+                                "public_ip": machine.public_ip,
+                            }})
+                        else:
+                            reconnect_bridge(prov, machine)
                 elif build["status"] in ("stopped", "deleted", "failed") and previous.get("instance"):
                     subprocess.run(["systemctl", "--user", "stop", bridge_unit(previous["instance"])],
                                    capture_output=True)
             except Exception as error:
                 print(f"warning: reconcile failed for {workspace['name']}: {error}", file=sys.stderr)
     finally:
-        if updates:
-            save_bridge_records(updates)
         # Always run periodic lease-stop + stale-workspace auto-delete regardless of bridge errors.
         stamp = STATE / "last-gc.ts"
         now_ts = time.time()
@@ -1292,9 +1529,36 @@ def main(default_provider: str = "aws", prog: str | None = None) -> int:
     if args.action == "links":
         show_links(args.workspace, settings, provider.filter_hint)
         return 0
+    if args.action in ("wait", "logs"):
+        owner = api("users/me")["id"]
+        machine = provider.find_instance(args.workspace, owner)
+        if machine.state != "running":
+            msg = ("Workspace is not running; resume it to inspect logs"
+                   if args.action == "wait" else "Resume the workspace before reading logs")
+            raise RuntimeError(msg)
+        if args.action == "wait":
+            return wait_for_job(provider, args.workspace, machine, job_id=args.job, poll=args.poll, max_wait=args.timeout)
+        ensure_controller_ssh(provider, machine)
+        record, output = read_job_logs(machine, job_id=args.job, lines=args.lines)
+        if record is None:
+            print(f"{args.workspace}: no job records found")
+            return 0
+        print(json.dumps(record, indent=2))
+        if output:
+            print("--- output ---")
+            print(output)
+        return 0
 
     lock = (STATE / (getattr(args, "workspace", "setup") + ".lock")).open("a")
     fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        return _run_locked_action(args, provider, settings, origin, job_command, parser, lock)
+    finally:
+        lock.close()
+
+
+def _run_locked_action(args, provider: Provider, settings: dict, origin: dict | None,
+                       job_command: list[str], parser: argparse.ArgumentParser, lock) -> int:
     if args.action in ("setup", "publish-template"):
         publish(provider, settings, refresh_guard=args.action == "setup")
         return 0
@@ -1416,66 +1680,74 @@ def main(default_provider: str = "aws", prog: str | None = None) -> int:
             pass
     elif args.action == "connect":
         connect(provider, args.workspace)
-    elif args.action == "wait":
-        if machine.state != "running":
-            raise RuntimeError("Workspace is not running; resume it to inspect logs")
-        return wait_for_job(provider, args.workspace, machine, job_id=args.job, poll=args.poll, max_wait=args.timeout)
-    elif args.action == "logs":
-        if machine.state != "running":
-            raise RuntimeError("Resume the workspace before reading logs")
-        ensure_controller_ssh(provider, machine)
-        record, output = read_job_logs(machine, job_id=args.job, lines=args.lines)
-        if record is None:
-            print(f"{args.workspace}: no job records found")
-            return 0
-        print(json.dumps(record, indent=2))
-        if output:
-            print("--- output ---")
-            print(output)
     elif args.action in ("hold", "extend", "run"):
         if args.timeout <= 0:
             parser.error("timeout must be positive and finite")
         if machine.state != "running":
             raise RuntimeError("Resume the workspace before running commands or holding leases")
         ensure_controller_ssh(provider, machine)
-        units = active_jobs(machine)
-        if units and args.action == "run":
-            raise RuntimeError("A job is already running; this worker runs one job at a time")
-        if args.action == "extend":
+        if args.action == "hold":
+            acquire_lease(provider, machine, args.timeout + 300, owner="hold")
+        elif args.action == "extend":
+            units = active_jobs(machine, include_deactivating=False)
             if len(units) != 1:
                 raise RuntimeError("extend requires exactly one running job (use hold for idle/interactive work)")
-            remote(machine, ["/usr/local/bin/workspace-job", "extend",
-                             units[0].removesuffix(".service"), str(args.timeout)])
-        renew(provider, machine, args.timeout + 300)
-        remote(machine, ["sudo", "/usr/local/bin/workspace-lease", "hold", str(args.timeout + 300)])
-        if args.action == "run":
+            job = units[0].removesuffix(".service")
+            lease_owner = f"job:{job}"
+            acquire_lease(provider, machine, args.timeout + 300, owner=lease_owner)
+            try:
+                remote(machine, ["/usr/local/bin/workspace-job", "extend", job, str(args.timeout)])
+            except BaseException:
+                try:
+                    if f"{job}.service" not in active_jobs(machine, include_deactivating=False):
+                        release_lease(provider, machine, owner=lease_owner)
+                except Exception:
+                    pass
+                raise
+            if f"{job}.service" not in active_jobs(machine, include_deactivating=False):
+                release_lease(provider, machine, owner=lease_owner)
+                raise RuntimeError(f"Job {job} finished before extend completed")
+        else:
+            if active_jobs(machine):
+                raise RuntimeError("A job is already running; this worker runs one job at a time")
             directory = project_record(args.workspace, machine)["projects"].get(args.project) if args.project else "/home/ubuntu/projects"
             if not directory:
                 raise RuntimeError(f"Unknown manifest project: {args.project}")
             job = "coder-job-" + uuid.uuid4().hex[:12]
-            remote(machine, ["sudo", "systemd-run", "--unit", job, "--uid", "ubuntu", "--gid", "ubuntu",
-                "--property", "WorkingDirectory=" + directory,
-                "--property", f"ExecStopPost=/usr/local/bin/workspace-job finalize {job}",
-                "/usr/local/bin/workspace-job", "run", job, str(args.timeout)] + job_command)
+            lease_owner = f"job:{job}"
+            acquire_lease(provider, machine, args.timeout + 300, owner=lease_owner)
+            try:
+                remote(machine, ["sudo", "systemd-run", "--unit", job, "--uid", "ubuntu", "--gid", "ubuntu",
+                    "--property", "WorkingDirectory=" + directory,
+                    "--property", f"ExecStopPost=/usr/local/bin/workspace-job finalize {job}",
+                    "/usr/local/bin/workspace-job", "run", job, str(args.timeout)] + job_command)
+            except BaseException:
+                # Only release the job lease if the transient unit is confirmed not to have started.
+                try:
+                    if f"{job}.service" not in active_jobs(machine):
+                        release_lease(provider, machine, owner=lease_owner)
+                except Exception:
+                    pass
+                raise
             print(f"Detached job {job}; timeout {args.timeout}s; use coder-{provider.name} wait/fetch {args.workspace}", flush=True)
             if args.wait:
+                lock.close()
                 return wait_for_job(provider, args.workspace, machine, job_id=job, poll=args.poll)
     elif args.action == "fetch":
         if machine.state != "running":
             raise RuntimeError("Resume the stopped workspace before fetching its preserved results")
         ensure_controller_ssh(provider, machine)
-        target = STATE / "results" / args.workspace
-        target.mkdir(parents=True, exist_ok=True)
-        renew(provider, machine, 300)
-        remote(machine, ["sudo", "/usr/local/bin/workspace-lease", "hold", "300"])
         if active_jobs(machine):
             raise RuntimeError(f"Wait for the registered job before collecting (use coder-{provider.name} wait {args.workspace})")
-        logs = subprocess.run(ssh_args(machine) + ["test -d /home/ubuntu/.local/state/coder-jobs"], capture_output=True)
-        if logs.returncode == 0:
-            run(["rsync", "-azs", "-e", shlex.join(ssh_args(machine)[:-1]),
-                 ssh_args(machine)[-1] + ":.local/state/coder-jobs/", str(target) + "/"])
-        if (STATE / "manifests" / (args.workspace + ".json")).exists() or "SourceSnapshot" in machine.tags:
-            fetch_projects(args.workspace, machine)
+        target = STATE / "results" / args.workspace
+        target.mkdir(parents=True, exist_ok=True)
+        with scoped_lease(provider, machine, 300, f"op:fetch-{uuid.uuid4().hex[:8]}"):
+            logs = subprocess.run(ssh_args(machine) + ["test -d /home/ubuntu/.local/state/coder-jobs"], capture_output=True)
+            if logs.returncode == 0:
+                run(["rsync", "-azs", "-e", shlex.join(ssh_args(machine)[:-1]),
+                     ssh_args(machine)[-1] + ":.local/state/coder-jobs/", str(target) + "/"])
+            if (STATE / "manifests" / (args.workspace + ".json")).exists() or "SourceSnapshot" in machine.tags:
+                fetch_projects(args.workspace, machine)
         print(f"Results retrieved into {target}")
     return 0
 

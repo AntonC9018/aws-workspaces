@@ -53,7 +53,8 @@ class ImageSpecTests(unittest.TestCase):
             spec_file = Path(directory) / "demo.json"
             spec_file.write_text(json.dumps({"version": 1, "project": "demo", "commands": ["true"]}))
             loaded = images.load_spec(spec_file)
-            prov = Mock()
+            from coder_workspace.providers import Provider
+            prov = Mock(spec=Provider)
             prov.name = "oci"
             prov.list_images.return_value = [{"id": "ocid1.image.existing", "name": loaded["name"], "hash": loaded["hash"]}]
             result = controller.bake_image(prov, {}, spec_path=str(spec_file))
@@ -131,20 +132,33 @@ class ImageSpecTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory)
             machine = Instance(id="i-1", name="dev", state="running", public_ip="1.2.3.4",
-                               instance_type="e5-2c-8g", provider="oci", tags={})
-            prov = Mock()
+                               instance_type="e5-2c-8g", provider="oci",
+                               tags={"LeaseExpiresAt": "2099-01-01T00:00:00+00:00"})
+            from coder_workspace.providers import Provider
+            prov = Mock(spec=Provider)
             prov.name = "oci"
             prov.find_instance.return_value = machine
+            prov.get_instance.return_value = machine
             ok = subprocess.CompletedProcess([], 0, stdout=buf.getvalue(), stderr=b"")
+            lease_release = subprocess.CompletedProcess(
+                [], 0, stdout=json.dumps({"until": 1300, "remaining": 300.0}), stderr="")
+            def fake_remote(_machine, cmd, **_kwargs):
+                if cmd[:3] == ["sudo", "/usr/local/bin/workspace-lease", "release"]:
+                    return lease_release
+                return subprocess.CompletedProcess([], 0, stdout="", stderr="")
             with patch.object(controller, "STATE", state), \
                  patch.object(controller, "api", return_value={"id": "owner-1"}), \
                  patch.object(controller, "ensure_controller_ssh"), \
                  patch.object(controller, "renew"), \
-                 patch.object(controller, "remote") as remote_mock, \
+                 patch.object(controller, "remote", side_effect=fake_remote) as remote_mock, \
                  patch.object(controller.subprocess, "run", return_value=ok) as run_mock:
                 controller.authorize_unity(prov, "dev", login=True)
             self.assertTrue((state / "unity/auth-bundle.tar").is_file())
             remote_calls = [c.args[1] for c in remote_mock.call_args_list]
+            lease_calls = [c for c in remote_calls if c[:2] == ["sudo", "/usr/local/bin/workspace-lease"]]
+            self.assertEqual(len(lease_calls), 2)
+            self.assertTrue(lease_calls[0][5].startswith("op:unity-"))
+            self.assertEqual(lease_calls[1][2:5], ["release", "--owner", lease_calls[0][5]])
             self.assertIn(["unity", "license", "activate", "--personal", "--accept-eula"], remote_calls)
             self.assertIn(["unity", "license", "status"], remote_calls)
             self.assertTrue(any("unity auth login --insecure-storage" in " ".join(c.args[0])
