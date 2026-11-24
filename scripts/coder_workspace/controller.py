@@ -385,6 +385,8 @@ UNITY_AUTH_ROOTS = (
     ".config/unity-cli", ".local/share/unity-cli",
     ".config/Unity", ".local/share/Unity",
     ".config/unity3d", ".local/share/unity3d", ".unity",
+    # Unity CLI 1.x keeps its session in the Hub account store and the auth broker.
+    ".config/unityhub", ".local/share/UnityAuthBroker", ".local/share/unity-keyring",
 )
 
 
@@ -429,7 +431,8 @@ def authorize_unity(provider: Provider, name: str, *, license_path: str | None =
         remote(machine, ["bash", "-c",
             "set -e; "
             "if command -v unity >/dev/null; then unity license return -y; fi; "
-            "rm -rf ~/.config/unity* ~/.local/share/unity* ~/.config/Unity ~/.local/share/Unity ~/.unity"])
+            "rm -rf ~/.config/unity* ~/.local/share/unity* ~/.config/Unity ~/.local/share/Unity ~/.unity "
+            "~/.local/share/UnityAuthBroker"])
         print(f"{name}: returned Unity license and cleared worker Unity session")
         return
 
@@ -669,11 +672,14 @@ def bake_image(provider: Provider, settings: dict, *, spec_path: str,
                 "/opt/coder-agent.sh /var/lib/coder-workspace/lease.json /var/lib/coder-workspace/lease.lock "
                 "/home/ubuntu/.config/coder-github /home/ubuntu/.config/unity* /home/ubuntu/.local/share/unity* "
                 "/home/ubuntu/.config/Unity /home/ubuntu/.local/share/Unity /home/ubuntu/.unity "
+                "/home/ubuntu/.local/share/UnityAuthBroker /root/.local/share/UnityAuthBroker "
                 "/root/.config/unity* /root/.local/share/unity* /root/.config/Unity /root/.local/share/Unity "
                 "/root/.unity /root/.cache /root/.bash_history /home/ubuntu/.bash_history "
                 "/home/ubuntu/.ssh/authorized_keys /root/.ssh/authorized_keys /etc/ssh/ssh_host_* "
                 "/home/ubuntu/.local/state/coder-jobs /home/ubuntu/.cache/coder-transfers "
                 "/home/ubuntu/projects/snapshots /tmp/coder-bake-* /tmp/unity-* /var/tmp/*; "
+                # Setup runs as root with HOME preserved, so it can leave root-owned dirs in ~ubuntu.
+                "sudo chown -R ubuntu:ubuntu /home/ubuntu; "
                 "sudo apt-get -o DPkg::Lock::Timeout=120 clean || true; "
                 "sudo rm -rf /var/lib/apt/lists/*; "
                 "sudo journalctl --rotate --vacuum-time=1s || true; "

@@ -29,3 +29,12 @@ On workers with `/usr/local/bin/unity` (Unity CLI v1.0.1):
 - `coder-oci authorize-unity NAME --return` returns the seat and clears worker Unity state before
   stopping/deleting.
 - Offline `.alf`/`.ulf` (`--create-alf`, `--license FILE`) is Enterprise/Industry only.
+
+Image requirements and pitfalls:
+
+- Include `unzip` in `packages`: `unity license activate` downloads the licensing client as a zip
+  and otherwise fails with "Can't reach the Unity licensing client".
+- Unity CLI 1.x keeps its session in `~/.config/unityhub`, `~/.local/share/UnityAuthBroker`, and
+  `~/.local/share/unity-keyring`. The broker may bind tokens to the machine, so expect `--login`
+  again on a fresh worker when the cached session is rejected.
+- `coder-oci run` starts in `~/projects`; pass `--project NAME` to start in the synced checkout.
