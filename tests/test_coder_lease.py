@@ -32,10 +32,21 @@ class LeaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "lease.json"
             state.write_text(json.dumps({"until": 10000}))
-            with patch.object(lease, "STATE", state), patch.object(lease.time, "time", return_value=1000):
+            with patch.object(lease, "STATE", state), patch.object(lease.time, "time", return_value=1000), \
+                    patch.object(lease, "other_job_running", return_value=False):
                 with patch("sys.argv", ["workspace-lease", "complete"]):
                     lease.main()
                 self.assertEqual(json.loads(state.read_text())["until"], 1300)
+
+    def test_completion_keeps_hold_of_a_job_that_already_started(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "lease.json"
+            state.write_text(json.dumps({"until": 10000}))
+            with patch.object(lease, "STATE", state), patch.object(lease.time, "time", return_value=1000), \
+                    patch.object(lease, "other_job_running", return_value=True):
+                with patch("sys.argv", ["workspace-lease", "complete"]):
+                    lease.main()
+                self.assertEqual(json.loads(state.read_text())["until"], 10000)
 
 
 if __name__ == "__main__":

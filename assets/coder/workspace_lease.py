@@ -24,6 +24,13 @@ def update(action):
         return result
 
 
+def other_job_running():
+    """Whether a coder job is still running; a job being finalized is no longer "running"."""
+    units = subprocess.run(["systemctl", "list-units", "--state=running", "--no-legend", "coder-job-*.service"],
+                           capture_output=True, text=True)
+    return bool(units.stdout.strip())
+
+
 def main():
     parser = argparse.ArgumentParser(description="Workspace leases default to five minutes (300s).")
     parser.add_argument("action", choices=["hold", "tick", "complete", "status"])
@@ -34,8 +41,10 @@ def main():
     if args.action == "hold":
         update(lambda s: s.update(until=max(s["until"], time.time() + args.seconds)))
     elif args.action == "complete":
-        # Completion returns to the normal five-minute idle countdown.
-        update(lambda s: s.update(until=time.time() + DEFAULT_TIMEOUT))
+        # Completion returns to the normal five-minute idle countdown, unless another job already
+        # started: a finishing unit's ExecStopPost can run after the next job's hold.
+        if not other_job_running():
+            update(lambda s: s.update(until=time.time() + DEFAULT_TIMEOUT))
     elif args.action == "status":
         print(STATE.read_text())
     elif update(lambda s: (s.update(until=time.time() + 600) or False) if s["until"] == 0 else s["until"] <= time.time()):

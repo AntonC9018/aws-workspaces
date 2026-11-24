@@ -260,10 +260,11 @@ def connect(provider: Provider, name: str) -> Instance:
                 print(f"{name}: bridge restored; preserving the active job without bootstrap changes")
                 return machine
             repair_bootstrap(provider, machine)
-            remote(machine, ["sudo", "/usr/local/bin/workspace-lease", "complete"])
-            renew(provider, machine, 300, preserve=False)
+            # Never shorten leases here: reconcile reconnects in the background and can race a
+            # `run`, `authorize-unity`, or `hold` that has just extended them.
+            renew(provider, machine, 300)
             remember_bridge(name, machine)
-            print(f"{name}: private Coder bridge ready; default lease is five minutes")
+            print(f"{name}: private Coder bridge ready; existing leases preserved")
             return machine
         detail = (ready.stderr or ready.stdout or "").strip().splitlines()
         last_probe = f"exit {ready.returncode}" + (f": {detail[-1]}" if detail else "")
