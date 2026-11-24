@@ -204,13 +204,24 @@ def active_jobs(machine: Instance, *, include_deactivating: bool = True) -> list
 
 
 def _load_worker_helpers(provider: Provider) -> dict[str, str]:
-    template_dir = os.environ.get(provider.template_env_var)
-    if not template_dir:
-        return {}
-    root = Path(template_dir)
     helpers = {}
-    for filename, target in WORKER_HELPERS:
-        source = root / filename
+    template_dir = os.environ.get(provider.template_env_var)
+    if template_dir:
+        root = Path(template_dir)
+        for filename, target in WORKER_HELPERS:
+            source = root / filename
+            if source.is_file():
+                helpers[target] = source.read_text()
+        if helpers:
+            return helpers
+    repo_root = Path(__file__).resolve().parents[2]
+    fallback_paths = {
+        "workspace-lease": repo_root / "assets/coder/workspace_lease.py",
+        "workspace-job": repo_root / "assets/coder/workspace_job.py",
+        "workspace-transfer": Path(__file__).resolve().parent / "transfer.py",
+        "workspace-github-credential": repo_root / "assets/coder/github_credential.py",
+    }
+    for target, source in fallback_paths.items():
         if source.is_file():
             helpers[target] = source.read_text()
     return helpers
@@ -228,6 +239,16 @@ for target, content in json.load(sys.stdin).items():
     temp.write_text(content)
     temp.chmod(0o755)
     os.replace(temp, dest)
+per_boot = pathlib.Path("/var/lib/cloud/scripts/per-boot/coder-lease")
+if per_boot.is_file():
+    original = per_boot.read_text()
+    patched = original.replace("/usr/local/bin/workspace-lease hold 600\n",
+                               "/usr/local/bin/workspace-lease hold 600 --owner boot\n")
+    if patched != original:
+        temp = per_boot.with_suffix(".tmp")
+        temp.write_text(patched)
+        temp.chmod(0o755)
+        os.replace(temp, per_boot)
 '''
     remote(machine, ["sudo", "python3", "-c", installer], input=json.dumps(helpers))
     return True
@@ -263,11 +284,23 @@ def acquire_lease(provider: Provider, machine: Instance, seconds: int, *, owner:
     guest_lease(provider, machine, ["hold", str(seconds), "--owner", owner])
 
 
+def sync_cloud_lease_from_guest(provider: Provider, machine: Instance, remaining: float) -> None:
+    """Shorten or preserve the cloud deadline from guest state without letting the guest extend it."""
+    provider.assert_guard(instance_type=machine.tags.get("InstanceSize") or None)
+    now = dt.datetime.now(dt.timezone.utc)
+    floor = now + dt.timedelta(seconds=DEFAULT_LEASE_SECONDS + 60)
+    desired = now + dt.timedelta(seconds=max(DEFAULT_LEASE_SECONDS, math.ceil(remaining)) + 60)
+    latest = provider.get_instance(machine.id)
+    existing = latest.lease_expires_at if isinstance(latest, Instance) else None
+    cap = max(existing, floor) if existing is not None else floor
+    deadline = min(cap, desired)
+    provider.set_tags(machine, {"LeaseExpiresAt": deadline.isoformat(), "StoppedSince": ""})
+
+
 def release_lease(provider: Provider, machine: Instance, *, owner: str) -> None:
     state = guest_lease(provider, machine, ["release", "--owner", owner], capture_json=True)
     if isinstance(state, dict) and isinstance(state.get("remaining"), (int, float)):
-        remaining = max(DEFAULT_LEASE_SECONDS, math.ceil(float(state["remaining"])))
-        renew(provider, machine, remaining, preserve=False)
+        sync_cloud_lease_from_guest(provider, machine, float(state["remaining"]))
     else:
         renew(provider, machine, DEFAULT_LEASE_SECONDS, preserve=True)
 
@@ -284,9 +317,22 @@ def scoped_lease(provider: Provider, machine: Instance, seconds: int, owner: str
     finally:
         try:
             release_lease(provider, machine, owner=owner)
-        except Exception:
+        except Exception as error:
             if not failed:
-                raise
+                print(f"warning: could not release temporary lease {owner} on {machine.name}: {error}",
+                      file=sys.stderr)
+
+
+BOOT_LEASE_UNIT = (
+    "[Unit]\n"
+    "Description=Grant startup workspace lease before lease timer ticks\n"
+    "Before=coder-lease.timer\n"
+    "[Service]\n"
+    "Type=oneshot\n"
+    "ExecStart=/usr/local/bin/workspace-lease hold 600 --owner boot\n"
+    "[Install]\n"
+    "WantedBy=multi-user.target\n"
+)
 
 
 def repair_bootstrap(provider: Provider, machine: Instance) -> None:
@@ -296,37 +342,53 @@ def repair_bootstrap(provider: Provider, machine: Instance) -> None:
         raw = gzip.decompress(raw)
     config = json.loads(raw.decode().split("\n", 1)[1])
     helpers = _load_worker_helpers(provider)
+    if "workspace-lease" not in helpers or "workspace-job" not in helpers:
+        raise RuntimeError(f"Could not load runtime helpers for {provider.name} (check {provider.template_env_var})")
     repair = r'''
 import json, os, pathlib, pwd, grp, subprocess, sys
 payload = json.load(sys.stdin)
 config = payload["config"]
 helpers = payload["helpers"]
+boot_unit = payload["boot_unit"]
 user = pwd.getpwnam("ubuntu")
 os.chown(user.pw_dir, user.pw_uid, user.pw_gid)
-for item in config["write_files"]:
-    path = pathlib.Path(item["path"])
-    content = item["content"]
-    if str(path) == "/var/lib/cloud/scripts/per-boot/coder-lease":
-        content = content.replace("/usr/local/bin/workspace-lease hold 600\n",
-                                  "/usr/local/bin/workspace-lease hold 600 --owner boot\n")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content)
-    path.chmod(int(item.get("permissions", "0644"), 8))
-    if "owner" in item:
-        owner_user, owner_group = item["owner"].split(":")
-        os.chown(path, pwd.getpwnam(owner_user).pw_uid, grp.getgrnam(owner_group).gr_gid)
 for target, content in helpers.items():
     dest = pathlib.Path("/usr/local/bin") / target
     temp = dest.with_suffix(".tmp")
     temp.write_text(content)
     temp.chmod(0o755)
     os.replace(temp, dest)
+helper_paths = {str(pathlib.Path("/usr/local/bin") / target) for target in helpers}
+for item in config["write_files"]:
+    path = pathlib.Path(item["path"])
+    if str(path) in helper_paths:
+        continue
+    content = item["content"]
+    if str(path) == "/var/lib/cloud/scripts/per-boot/coder-lease":
+        content = content.replace("/usr/local/bin/workspace-lease hold 600\n",
+                                  "/usr/local/bin/workspace-lease hold 600 --owner boot\n")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + ".tmp")
+    temp.write_text(content)
+    temp.chmod(int(item.get("permissions", "0644"), 8))
+    if "owner" in item:
+        owner_user, owner_group = item["owner"].split(":")
+        os.chown(temp, pwd.getpwnam(owner_user).pw_uid, grp.getgrnam(owner_group).gr_gid)
+    os.replace(temp, path)
+boot_unit_path = pathlib.Path("/etc/systemd/system/coder-lease-boot.service")
+temp = boot_unit_path.with_suffix(".tmp")
+temp.write_text(boot_unit)
+temp.chmod(0o644)
+os.replace(temp, boot_unit_path)
 for command in config["runcmd"]:
     if command.strip() == "/usr/local/bin/workspace-lease hold 600":
         command = "/usr/local/bin/workspace-lease hold 600 --owner boot"
     subprocess.run(command, shell=True, check=True)
+subprocess.run(["systemctl", "daemon-reload"], check=True)
+subprocess.run(["systemctl", "enable", "coder-lease-boot.service"], check=True)
 '''
-    remote(machine, ["sudo", "python3", "-c", repair], input=json.dumps({"config": config, "helpers": helpers}))
+    remote(machine, ["sudo", "python3", "-c", repair],
+           input=json.dumps({"config": config, "helpers": helpers, "boot_unit": BOOT_LEASE_UNIT}))
 
 
 def ensure_controller_ssh(provider: Provider, machine: Instance) -> bool:
@@ -340,24 +402,47 @@ def ensure_controller_ssh(provider: Provider, machine: Instance) -> bool:
     return False
 
 
+def bridge_target_ip(instance_id: str) -> str | None:
+    res = subprocess.run(
+        ["systemctl", "--user", "show", "-p", "Description", "--value", bridge_unit(instance_id)],
+        capture_output=True, text=True,
+    )
+    if res.returncode != 0 or not isinstance(res.stdout, str):
+        return None
+    parts = res.stdout.strip().split()
+    if len(parts) == 4 and parts[0] == "Coder" and parts[1] == "bridge" and parts[2] == instance_id:
+        return parts[3]
+    return None
+
+
+def bridge_matches_ip(machine: Instance) -> bool:
+    return bool(machine.public_ip) and bridge_target_ip(machine.id) == machine.public_ip
+
+
 def start_bridge(machine: Instance) -> None:
     unit = bridge_unit(machine.id)
     subprocess.run(["systemctl", "--user", "stop", unit], capture_output=True)
     run(["systemd-run", "--user", "--quiet", "--collect", "--unit", unit,
-         "--property", "Restart=on-failure", "--property", "RestartSec=5"] +
-        ssh_args(machine)[:-1] + ["-NT", "-o", "ExitOnForwardFailure=yes", "-R",
-                                  "127.0.0.1:7080:127.0.0.1:7080", ssh_args(machine)[-1]])
+         "--description", f"Coder bridge {machine.id} {machine.public_ip}",
+         "--property", "Restart=on-failure", "--property", "RestartSec=5",
+         *ssh_args(machine)[:-1], "-NT", "-o", "ExitOnForwardFailure=yes", "-R",
+         "127.0.0.1:7080:127.0.0.1:7080", ssh_args(machine)[-1]])
 
 
 def reconnect_bridge(provider: Provider, machine: Instance) -> None:
-    """Restore a dropped SSH bridge without touching leases or running bootstrap repair."""
+    """Restore a dropped or stale-IP SSH bridge without touching leases or running bootstrap repair."""
     ip_updated = ensure_controller_ssh(provider, machine)
     state = bridge_state({"instance": machine.id})
-    if state == "active" and not ip_updated:
-        return
-    if state == "activating" and not ip_updated:
+    if state in ("active", "activating") and not ip_updated and bridge_matches_ip(machine):
         return
     start_bridge(machine)
+
+
+CLOUD_INIT_READY_PROBE = (
+    "test -f /var/lib/cloud/instance/boot-finished "
+    "|| (command -v cloud-init >/dev/null && cloud-init status 2>/dev/null "
+    "| grep -Eq 'status: (done|error|degraded|disabled)')"
+)
 
 
 def connect(provider: Provider, name: str, *, wait_timeout: int = 240, restart_bridge: bool = True) -> Instance:
@@ -367,7 +452,8 @@ def connect(provider: Provider, name: str, *, wait_timeout: int = 240, restart_b
         raise RuntimeError(f"Workspace is {machine.state}; use coder-{provider.name} resume first")
     ip_updated = ensure_controller_ssh(provider, machine)
     unit = bridge_unit(machine.id)
-    if restart_bridge or ip_updated or bridge_state({"instance": machine.id}) == "inactive":
+    if (restart_bridge or ip_updated or bridge_state({"instance": machine.id}) == "inactive"
+            or not bridge_matches_ip(machine)):
         start_bridge(machine)
     deadline = time.monotonic() + wait_timeout
     last_probe = ""
@@ -375,7 +461,7 @@ def connect(provider: Provider, name: str, *, wait_timeout: int = 240, restart_b
         if attempt > 0 and time.monotonic() >= deadline:
             break
         ready = subprocess.run(
-            ssh_args(machine) + ["test -f /var/lib/cloud/instance/boot-finished"],
+            [*ssh_args(machine), CLOUD_INIT_READY_PROBE],
             capture_output=True, text=True,
         )
         if ready.returncode == 0:
@@ -417,7 +503,11 @@ def save_bridge_records(updates: dict, *, remove: list[str] | None = None) -> No
 def remember_bridge(name: str, machine: Instance) -> None:
     workspace = api("users/me/workspace/" + name)
     save_bridge_records({workspace["id"]: {
-        "build": workspace["latest_build"]["id"], "instance": machine.id, "provider": machine.provider}})
+        "build": workspace["latest_build"]["id"],
+        "instance": machine.id,
+        "provider": machine.provider,
+        "public_ip": machine.public_ip,
+    }})
 
 
 def should_connect(workspace: dict, previous: dict, bridge_alive: bool = True,
@@ -797,10 +887,11 @@ def bake_image(provider: Provider, settings: dict, *, spec_path: str,
             # Sanitize builder state, lease units, host keys, logs, and credentials before snapshotting.
             sanitize = (
                 "set -e; "
-                "sudo systemctl disable --now coder-workspace.service coder-lease.timer "
+                "sudo systemctl disable --now coder-workspace.service coder-lease-boot.service coder-lease.timer "
                 "apt-daily.timer apt-daily-upgrade.timer || true; "
-                "sudo rm -rf /etc/systemd/system/coder-workspace.service /etc/systemd/system/coder-lease.service "
-                "/etc/systemd/system/coder-lease.timer /var/lib/cloud/scripts/per-boot/coder-lease "
+                "sudo rm -rf /etc/systemd/system/coder-workspace.service /etc/systemd/system/coder-lease-boot.service "
+                "/etc/systemd/system/coder-lease.service /etc/systemd/system/coder-lease.timer "
+                "/var/lib/cloud/scripts/per-boot/coder-lease "
                 "/opt/coder-agent.sh /var/lib/coder-workspace/lease.json /var/lib/coder-workspace/lease.lock "
                 "/home/ubuntu/.config/coder-github /home/ubuntu/.config/unity* /home/ubuntu/.local/share/unity* "
                 "/home/ubuntu/.config/Unity /home/ubuntu/.local/share/Unity /home/ubuntu/.unity "
@@ -1199,7 +1290,6 @@ def reconcile(settings: dict, providers: list[Provider] | None = None) -> None:
     """Connect each successful dashboard start once, enforce OCI leases, and prune stale stopped workers."""
     registry_path = STATE / "dashboard-builds.json"
     registry = json.loads(registry_path.read_text()) if registry_path.exists() else {}
-    updates = {}
     active_providers = providers if providers is not None else configured_providers(settings)
     by_template = {p.template_name: p for p in active_providers}
     workspaces = api("workspaces?q=owner%3Ame")["workspaces"]
@@ -1234,10 +1324,16 @@ def reconcile(settings: dict, providers: list[Provider] | None = None) -> None:
                             print(f"warning: stopping guarded {prov.name} workspace {workspace['name']}: {guard_err}",
                                   file=sys.stderr)
                             prov.stop_instance(machine)
+                            subprocess.run(["systemctl", "--user", "stop", bridge_unit(machine.id)], capture_output=True)
                             continue
                         if is_new_build:
                             connect(prov, workspace["name"], wait_timeout=15, restart_bridge=False)
-                            updates[workspace["id"]] = {"build": build["id"], "instance": machine.id, "provider": prov.name}
+                            save_bridge_records({workspace["id"]: {
+                                "build": build["id"],
+                                "instance": machine.id,
+                                "provider": prov.name,
+                                "public_ip": machine.public_ip,
+                            }})
                         else:
                             reconnect_bridge(prov, machine)
                 elif build["status"] in ("stopped", "deleted", "failed") and previous.get("instance"):
@@ -1246,8 +1342,6 @@ def reconcile(settings: dict, providers: list[Provider] | None = None) -> None:
             except Exception as error:
                 print(f"warning: reconcile failed for {workspace['name']}: {error}", file=sys.stderr)
     finally:
-        if updates:
-            save_bridge_records(updates)
         # Always run periodic lease-stop + stale-workspace auto-delete regardless of bridge errors.
         stamp = STATE / "last-gc.ts"
         now_ts = time.time()
@@ -1435,9 +1529,36 @@ def main(default_provider: str = "aws", prog: str | None = None) -> int:
     if args.action == "links":
         show_links(args.workspace, settings, provider.filter_hint)
         return 0
+    if args.action in ("wait", "logs"):
+        owner = api("users/me")["id"]
+        machine = provider.find_instance(args.workspace, owner)
+        if machine.state != "running":
+            msg = ("Workspace is not running; resume it to inspect logs"
+                   if args.action == "wait" else "Resume the workspace before reading logs")
+            raise RuntimeError(msg)
+        if args.action == "wait":
+            return wait_for_job(provider, args.workspace, machine, job_id=args.job, poll=args.poll, max_wait=args.timeout)
+        ensure_controller_ssh(provider, machine)
+        record, output = read_job_logs(machine, job_id=args.job, lines=args.lines)
+        if record is None:
+            print(f"{args.workspace}: no job records found")
+            return 0
+        print(json.dumps(record, indent=2))
+        if output:
+            print("--- output ---")
+            print(output)
+        return 0
 
     lock = (STATE / (getattr(args, "workspace", "setup") + ".lock")).open("a")
     fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        return _run_locked_action(args, provider, settings, origin, job_command, parser, lock)
+    finally:
+        lock.close()
+
+
+def _run_locked_action(args, provider: Provider, settings: dict, origin: dict | None,
+                       job_command: list[str], parser: argparse.ArgumentParser, lock) -> int:
     if args.action in ("setup", "publish-template"):
         publish(provider, settings, refresh_guard=args.action == "setup")
         return 0
@@ -1559,22 +1680,6 @@ def main(default_provider: str = "aws", prog: str | None = None) -> int:
             pass
     elif args.action == "connect":
         connect(provider, args.workspace)
-    elif args.action == "wait":
-        if machine.state != "running":
-            raise RuntimeError("Workspace is not running; resume it to inspect logs")
-        return wait_for_job(provider, args.workspace, machine, job_id=args.job, poll=args.poll, max_wait=args.timeout)
-    elif args.action == "logs":
-        if machine.state != "running":
-            raise RuntimeError("Resume the workspace before reading logs")
-        ensure_controller_ssh(provider, machine)
-        record, output = read_job_logs(machine, job_id=args.job, lines=args.lines)
-        if record is None:
-            print(f"{args.workspace}: no job records found")
-            return 0
-        print(json.dumps(record, indent=2))
-        if output:
-            print("--- output ---")
-            print(output)
     elif args.action in ("hold", "extend", "run"):
         if args.timeout <= 0:
             parser.error("timeout must be positive and finite")
@@ -1588,8 +1693,20 @@ def main(default_provider: str = "aws", prog: str | None = None) -> int:
             if len(units) != 1:
                 raise RuntimeError("extend requires exactly one running job (use hold for idle/interactive work)")
             job = units[0].removesuffix(".service")
-            remote(machine, ["/usr/local/bin/workspace-job", "extend", job, str(args.timeout)])
-            acquire_lease(provider, machine, args.timeout + 300, owner=f"job:{job}")
+            lease_owner = f"job:{job}"
+            acquire_lease(provider, machine, args.timeout + 300, owner=lease_owner)
+            try:
+                remote(machine, ["/usr/local/bin/workspace-job", "extend", job, str(args.timeout)])
+            except BaseException:
+                try:
+                    if f"{job}.service" not in active_jobs(machine, include_deactivating=False):
+                        release_lease(provider, machine, owner=lease_owner)
+                except Exception:
+                    pass
+                raise
+            if f"{job}.service" not in active_jobs(machine, include_deactivating=False):
+                release_lease(provider, machine, owner=lease_owner)
+                raise RuntimeError(f"Job {job} finished before extend completed")
         else:
             if active_jobs(machine):
                 raise RuntimeError("A job is already running; this worker runs one job at a time")
@@ -1605,13 +1722,16 @@ def main(default_provider: str = "aws", prog: str | None = None) -> int:
                     "--property", f"ExecStopPost=/usr/local/bin/workspace-job finalize {job}",
                     "/usr/local/bin/workspace-job", "run", job, str(args.timeout)] + job_command)
             except BaseException:
+                # Only release the job lease if the transient unit is confirmed not to have started.
                 try:
-                    release_lease(provider, machine, owner=lease_owner)
+                    if f"{job}.service" not in active_jobs(machine):
+                        release_lease(provider, machine, owner=lease_owner)
                 except Exception:
                     pass
                 raise
             print(f"Detached job {job}; timeout {args.timeout}s; use coder-{provider.name} wait/fetch {args.workspace}", flush=True)
             if args.wait:
+                lock.close()
                 return wait_for_job(provider, args.workspace, machine, job_id=job, poll=args.poll)
     elif args.action == "fetch":
         if machine.state != "running":

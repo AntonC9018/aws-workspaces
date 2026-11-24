@@ -10,9 +10,18 @@ import subprocess
 import time
 
 STATE = Path("/var/lib/coder-workspace/lease.json")
+BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
 DEFAULT_TIMEOUT = 300
 BOOT_GRACE = 600
 OWNER_RE = re.compile(r"^[A-Za-z0-9:._-]{1,128}$")
+
+
+def current_boot_id():
+    """Return the kernel boot UUID so leases never leak across VM stop/start cycles."""
+    try:
+        return BOOT_ID_PATH.read_text().strip()
+    except OSError:
+        return ""
 
 
 def other_job_running():
@@ -27,8 +36,16 @@ def other_job_running():
     return bool(units.stdout.strip())
 
 
-def _load_state(raw, now):
+def _effective_until(state):
+    return max([state["idle_until"], *state["leases"].values()], default=0.0)
+
+
+def _load_state(raw, now, boot_id=""):
     if not raw or (raw.get("until", 0) == 0 and raw.get("idle_until", 0) == 0 and not raw.get("leases")):
+        return {"idle_until": 0.0, "leases": {}, "_uninitialized": True}
+    stored_boot = raw.get("boot_id", "")
+    if boot_id and stored_boot and stored_boot != boot_id:
+        # New kernel boot: discard pre-stop leases and expired timestamps so resume starts fresh.
         return {"idle_until": 0.0, "leases": {}, "_uninitialized": True}
     if "idle_until" not in raw and "leases" not in raw:
         legacy_until = float(raw.get("until", 0))
@@ -46,19 +63,32 @@ def _load_state(raw, now):
         else:
             # Preserve expired timestamp floor so an exhausted lease never resets to uninitialized (0).
             idle_until = max(idle_until, ts)
-    return {"idle_until": idle_until, "leases": leases, "_uninitialized": False}
+    state = {"idle_until": idle_until, "leases": leases, "_uninitialized": False}
+    # Preserve a higher scalar 'until' written by an older helper on another controller host.
+    raw_until = raw.get("until", 0)
+    if isinstance(raw_until, (int, float)) and float(raw_until) > _effective_until(state) and float(raw_until) > now:
+        state["leases"]["legacy"] = max(state["leases"].get("legacy", 0.0), float(raw_until))
+    return state
 
 
-def _effective_until(state):
-    return max([state["idle_until"], *state["leases"].values()], default=0.0)
-
-
-def _serialize(state):
-    return {
+def _serialize(state, boot_id=""):
+    payload = {
         "until": _effective_until(state),
         "idle_until": state["idle_until"],
         "leases": dict(sorted(state["leases"].items())),
     }
+    if boot_id:
+        payload["boot_id"] = boot_id
+    return payload
+
+
+def _release_owner(state, now, owner):
+    state["leases"].pop(owner, None)
+    state["idle_until"] = max(state["idle_until"], now + DEFAULT_TIMEOUT)
+    if owner.startswith("job:") and "legacy" in state["leases"] and not other_job_running():
+        state["leases"].pop("legacy", None)
+    elif owner == "boot" and "legacy" in state["leases"] and state["leases"]["legacy"] <= now + BOOT_GRACE:
+        state["leases"].pop("legacy", None)
 
 
 def update(action):
@@ -66,10 +96,11 @@ def update(action):
     with STATE.with_suffix(".lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         now = time.time()
+        boot_id = current_boot_id()
         raw = json.loads(STATE.read_text()) if STATE.exists() else {}
-        state = _load_state(raw, now)
+        state = _load_state(raw, now, boot_id)
         result = action(state, now)
-        payload = _serialize(state)
+        payload = _serialize(state, boot_id)
         temp = STATE.with_suffix(".tmp")
         temp.write_text(json.dumps(payload))
         os.replace(temp, STATE)
@@ -93,21 +124,16 @@ def main():
         parser.error("timeout must be positive")
 
     if args.action == "hold":
-        owner = _validate_owner(parser, args.owner or "hold")
+        # Ownerless hold maps to 'legacy' so unpatched boot/job scripts never masquerade as explicit user holds.
+        owner = _validate_owner(parser, args.owner or "legacy")
         _, payload, now = update(lambda s, t: s["leases"].update({owner: max(s["leases"].get(owner, 0.0), t + args.seconds)}))
     elif args.action == "release":
         owner = _validate_owner(parser, args.owner)
-        def _release(s, t):
-            s["leases"].pop(owner, None)
-            s["idle_until"] = max(s["idle_until"], t + DEFAULT_TIMEOUT)
-        _, payload, now = update(_release)
+        _, payload, now = update(lambda s, t: _release_owner(s, t, owner))
     elif args.action == "complete":
         if args.owner:
             owner = _validate_owner(parser, args.owner)
-            def _complete_owned(s, t):
-                s["leases"].pop(owner, None)
-                s["idle_until"] = max(s["idle_until"], t + DEFAULT_TIMEOUT)
-            _, payload, now = update(_complete_owned)
+            _, payload, now = update(lambda s, t: _release_owner(s, t, owner))
         else:
             # Legacy ownerless completion: check systemd under the lock and never drop explicit holds.
             def _complete_legacy(s, t):
@@ -118,8 +144,9 @@ def main():
             _, payload, now = update(_complete_legacy)
     elif args.action == "status":
         now = time.time()
+        boot_id = current_boot_id()
         raw = json.loads(STATE.read_text()) if STATE.exists() else {}
-        payload = _serialize(_load_state(raw, now))
+        payload = _serialize(_load_state(raw, now, boot_id), boot_id)
         print(json.dumps(payload | {"remaining": max(0.0, payload["until"] - now)}))
         return
     else:
