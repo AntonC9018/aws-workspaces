@@ -27,8 +27,9 @@ On workers with `/usr/local/bin/unity` (Unity CLI v1.0.1):
   (`~/.local/state/coder-workspaces/unity/auth-bundle.tar`); pass `--login` on first use to print
   the browser sign-in URL and cache auth locally.
 - `coder-oci authorize-unity NAME --return` returns returnable seats and clears worker Unity state
-  before stopping/deleting (free Personal seats cannot be returned remotely, so `--return` still
-  wipes worker auth files).
+  before stopping/deleting. Free Personal seats cannot be returned remotely, so `--return` confirms
+  only Personal entitlements remain before wiping worker auth files; other return failures raise and
+  keep worker files for retry.
 - Offline `.alf`/`.ulf` (`--create-alf`, `--license FILE`) is Enterprise/Industry only.
 
 Image requirements and pitfalls:
@@ -36,8 +37,12 @@ Image requirements and pitfalls:
 - Include `unzip` in `packages`: `unity license activate` downloads the licensing client as a zip
   and otherwise fails with "Can't reach the Unity licensing client".
 - Unity CLI 1.x stores Hub accounts in `~/.config/unityhub/accounts.db` (SQLite WAL) and prefers
-  the RAM-only Linux kernel keyring (`keyutils`) unless `@keyring` syscalls are filtered.
-  `authorize-unity --login` runs under `SystemCallFilter=~@keyring` with `UNITY_NO_AUTH_BROKER=1`
-  so Unity writes `~/.local/share/unity-keyring/credentials.json` and snapshots `accounts.db` into
-  `auth-bundle.tar`, allowing cross-worker replay until Unity's OAuth refresh token expires.
+  the RAM-only Linux kernel keyring (`keyutils`) unless `@keyring` syscalls return `EPERM`.
+  `authorize-unity` runs Unity CLI via `sudo systemd-run` (requires systemd and passwordless sudo on
+  workers) with `SystemCallErrorNumber=EPERM`, `SystemCallFilter=~@keyring`, `UMask=0077`,
+  `UNITY_INSECURE_STORAGE=1`, and `UNITY_NO_AUTH_BROKER=1` so Unity uses
+  `~/.local/share/unity-keyring/credentials.json`. The controller snapshots `accounts.db` via
+  `sqlite3.backup()` into `auth-bundle.tar` and refreshes the bundle after replay, allowing
+  cross-worker replay until Unity's OAuth refresh token expires. Manual `unity` CLI auth commands in
+  user jobs need `UNITY_INSECURE_STORAGE=1 UNITY_NO_AUTH_BROKER=1` to read the replayed session.
 - `coder-oci run` starts in `~/projects`; pass `--project NAME` to start in the synced checkout.

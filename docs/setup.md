@@ -75,7 +75,7 @@ coder-oci bake-image --spec .coder-images/unity-6000.json
 coder-oci images --all
 coder-oci create dev --image colorshoot-unity-6000 --instance-type e5-4c-16g --disk-gb 80
 coder-oci authorize-unity dev --login  # activates Unity Personal via Unity CLI (caches auth locally)
-coder-oci authorize-unity dev --return # returns the seat and wipes worker Unity session
+coder-oci authorize-unity dev --return # returns returnable seats and wipes worker Unity session
 coder-oci delete-image colorshoot-unity-6000
 ```
 
