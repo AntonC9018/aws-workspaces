@@ -215,21 +215,16 @@ def collect(snapshot):
     stage = Path(tempfile.mkdtemp(prefix="result-", dir=cache))
     for project in plan["projects"]:
         source = contained(root, project["destination"])
-        output = stage / project["name"]
-        output.mkdir()
-        git(source, "bundle", "create", str(output / "commits.bundle"), "HEAD", "--branches")
-        (output / "changes.patch").write_bytes(git(source, "diff", "--binary", "--full-index", "HEAD", "--"))
         project["result_commit"] = git(source, "rev-parse", "HEAD").decode().strip()
-        new_files = [p for p in git(source, "ls-files", "--others", "--exclude-standard", "-z").decode().split("\x00") if p]
-        with tarfile.open(output / "untracked.tar", "w") as archive:
-            for rel, path in selected_files(source, new_files).items():
-                archive.add(path, arcname=rel, recursive=False)
+        project["result_dirty"] = bool(git(source, "status", "--porcelain"))
         project["missing_artifacts"] = [p for p in project["artifacts"] if not contained(source, p).exists()]
         artifacts = selected_files(source, [p for p in project["artifacts"] if p not in project["missing_artifacts"]])
-        for rel, path in artifacts.items():
-            target = contained(output / "artifacts", rel)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, target)
+        if artifacts:
+            output = stage / project["name"] / "artifacts"
+            for rel, path in artifacts.items():
+                target = contained(output, rel)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(path, target)
     plan["missing_files"] = []
     for extra in plan["files"]:
         source = contained(root, extra["destination"])
@@ -252,18 +247,6 @@ def restore(stage):
     for rel, expected in plan["result_hashes"].items():
         if digest(contained(stage, rel)) != expected:
             raise ValueError("Retrieved result hash mismatch")
-    checkouts = stage / "checkouts"
-    checkouts.mkdir()
-    for project in plan["projects"]:
-        source = stage / project["name"]
-        target = checkouts / project["name"]
-        git(checkouts, "clone", "--quiet", str(source / "commits.bundle"), str(target))
-        git(target, "checkout", "--quiet", "--detach", project["result_commit"])
-        patch = source / "changes.patch"
-        if patch.stat().st_size:
-            git(target, "apply", "--binary", str(patch))
-        extract_files(source / "untracked.tar", target)
-        git(target, "remote", "remove", "origin")
     return plan
 
 

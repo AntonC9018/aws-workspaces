@@ -36,9 +36,9 @@ shared VCN/IGW/subnet (fitting Oracle's 1-IGW Free Trial limit), a compartment b
 
 `run` starts a detached job with a 300-second default timeout; choose a finite `--timeout` for
 builds and pass `--wait` (or follow with `wait` / `logs`). Use `extend` while a job is running,
-or `hold` for quiet interactive work. `fetch` retrieves commits, dirty files, logs, and declared
-artifacts into a separate local directory without modifying your worktree. Run `delete` once you
-have verified the results.
+or `hold` for quiet interactive work. `fetch` saves git commit hashes in `manifest.json`, job logs,
+extra files, and declared artifacts into a separate local directory without storing repository
+checkouts or modifying your worktree. Run `delete` once you have verified the results.
 
 For private repositories, run `github-setup` once, install the App, then use
 `authorize build --repo OWNER/REPO`. Tokens cover one repository and default to read-only. Add

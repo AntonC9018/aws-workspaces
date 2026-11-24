@@ -10,8 +10,9 @@
 - `sync NAME --manifest FILE` needs an idle worker and never overwrites snapshots.
 - Add submodules as separate `projects[]` entries; rejects LFS, symlinks, artifact globs, and
   `.aws`/`.ssh`/`.gnupg`/`.git`.
-- Run `fetch NAME` after job exit; writes verified output to
-  `~/.local/state/coder-workspaces/results/NAME/` without editing local worktrees.
+- Run `fetch NAME` after job exit; writes git commit hashes (`manifest.json`), job logs, extra
+  files, and verified artifacts to `~/.local/state/coder-workspaces/results/NAME/` without saving
+  repository checkouts or editing local worktrees.
 
 ## Binary transfer over SSH
 

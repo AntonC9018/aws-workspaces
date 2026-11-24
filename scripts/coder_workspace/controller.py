@@ -1226,8 +1226,9 @@ def sync_projects(provider: Provider, name: str, machine: Instance, manifest: st
     print("Prepared projects: " + json.dumps(directories), flush=True)
 
 
-def fetch_projects(name: str, machine: Instance) -> None:
+def fetch_projects(provider: Provider, name: str, machine: Instance) -> None:
     record = project_record(name, machine)
+    install_worker_helpers(provider, machine)
     stage = json.loads(remote(machine, ["/usr/local/bin/workspace-transfer", "collect",
                                         record["manifest"]["snapshot"]], capture_output=True).stdout)
     target = STATE / "results" / name / (record["manifest"]["snapshot"] + "-" + uuid.uuid4().hex[:8])
@@ -1238,7 +1239,7 @@ def fetch_projects(name: str, machine: Instance) -> None:
     (target / "retrieved.json").write_text(json.dumps({
         "verified": True, "retrieved_at": dt.datetime.now(dt.timezone.utc).isoformat()}))
     remote(machine, ["/usr/local/bin/workspace-transfer", "cleanup", stage])
-    print(f"Verified project checkouts and artifacts retrieved into {target}", flush=True)
+    print(f"Verified project metadata and artifacts retrieved into {target}", flush=True)
 
 
 def _normalize_job_id(job_id: str | None) -> str | None:
@@ -1983,7 +1984,7 @@ def _run_locked_action(args, provider: Provider, settings: dict, origin: dict | 
                 run(["rsync", "-azs", "-e", shlex.join(ssh_args(machine)[:-1]),
                      ssh_args(machine)[-1] + ":.local/state/coder-jobs/", str(target) + "/"])
             if (STATE / "manifests" / (args.workspace + ".json")).exists() or "SourceSnapshot" in machine.tags:
-                fetch_projects(args.workspace, machine)
+                fetch_projects(provider, args.workspace, machine)
         print(f"Results retrieved into {target}")
     return 0
 

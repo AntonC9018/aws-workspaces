@@ -35,7 +35,7 @@ class TransferTests(unittest.TestCase):
             "files": [{"source": "build-config.txt", "destination": "shared/config.txt"}]}))
         return source, manifest
 
-    def test_round_trip_preserves_commits_dirty_files_artifacts_and_local_edits(self):
+    def test_round_trip_records_git_hashes_and_artifacts_without_saving_checkouts(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source, manifest = self.fixture(root)
@@ -52,20 +52,36 @@ class TransferTests(unittest.TestCase):
                 self.assertFalse((remote / "excluded.txt").exists())
                 transfer.git(remote, "add", "file.txt", "binary", "included.txt")
                 transfer.git(remote, "commit", "--quiet", "-m", "test: remote commit", "-m", "Generated-by: GPT 6.1 Sol")
-                (remote / "file.txt").write_text("remote uncommitted\n")
-                (remote / "new.txt").write_text("new remote source\n")
+                remote_commit = transfer.git(remote, "rev-parse", "HEAD").decode().strip()
                 (remote / "out").mkdir()
                 (remote / "out/build.bin").write_bytes(b"artifact\x00")
                 (home / "projects/snapshots" / plan["snapshot"] / "shared/config.txt").write_text("remote configuration\n")
+
+                clean_result = Path(transfer.collect(plan["snapshot"]))
+                clean_restored = transfer.restore(clean_result)
+                self.assertEqual(clean_restored["projects"][0]["commit"], plan["projects"][0]["commit"])
+                self.assertEqual(clean_restored["projects"][0]["result_commit"], remote_commit)
+                self.assertNotEqual(remote_commit, plan["projects"][0]["commit"])
+                self.assertFalse(clean_restored["projects"][0]["result_dirty"])
+
+                (remote / "file.txt").write_text("remote uncommitted\n")
+                (remote / "new.txt").write_text("new remote source\n")
                 result = Path(transfer.collect(plan["snapshot"]))
                 (source / "file.txt").write_text("concurrent local edit\n")
                 restored = transfer.restore(result)
+                self.assertEqual(restored["projects"][0]["result_commit"], remote_commit)
+                self.assertTrue(restored["projects"][0]["result_dirty"])
                 self.assertIn("missing-output", restored["projects"][0]["missing_artifacts"])
-                self.assertEqual((result / "checkouts/main/file.txt").read_text(), "remote uncommitted\n")
-                self.assertEqual((result / "checkouts/main/new.txt").read_text(), "new remote source\n")
+                self.assertFalse((result / "checkouts").exists())
+                self.assertFalse((result / "main/commits.bundle").exists())
+                self.assertFalse((result / "main/changes.patch").exists())
+                self.assertFalse((result / "main/untracked.tar").exists())
                 self.assertEqual((result / "main/artifacts/out/build.bin").read_bytes(), b"artifact\x00")
                 self.assertEqual((result / "extra/shared/config.txt").read_text(), "remote configuration\n")
                 self.assertEqual((source / "file.txt").read_text(), "concurrent local edit\n")
+                (result / "main/artifacts/out/build.bin").write_bytes(b"tampered")
+                with self.assertRaises(ValueError):
+                    transfer.restore(result)
                 with self.assertRaises(ValueError):
                     transfer.prepare(root / "input")
 

@@ -627,6 +627,44 @@ class ControllerTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 controller.repair_bootstrap(prov, machine)
 
+    def test_fetch_projects_updates_worker_helpers_and_verifies_without_checkouts(self):
+        from coder_workspace.providers import Provider
+        prov = Mock(spec=Provider)
+        prov.name = "oci"
+        machine = inst(state="running", provider="oci")
+        snapshot = "b" * 24
+        stage = "/home/ubuntu/.cache/coder-transfers/result-1"
+        fake_lib = Mock()
+        def fake_remote(_machine, cmd, **_kwargs):
+            if cmd == ["/usr/local/bin/workspace-transfer", "collect", snapshot]:
+                return Mock(stdout=json.dumps(stage))
+            return Mock(stdout="")
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            manifests = state / "manifests"
+            manifests.mkdir()
+            (manifests / "smoke.json").write_text(json.dumps({
+                "manifest": {"snapshot": snapshot, "projects": [{"name": "main"}]},
+                "instance_id": machine.id,
+            }))
+            with patch.object(controller, "STATE", state), \
+                    patch.object(controller, "install_worker_helpers", return_value=True) as install_mock, \
+                    patch.object(controller, "transfer_library", return_value=fake_lib), \
+                    patch.object(controller, "remote", side_effect=fake_remote) as remote_mock, \
+                    patch.object(controller, "run") as run_mock:
+                controller.fetch_projects(prov, "smoke", machine)
+            install_mock.assert_called_once_with(prov, machine)
+            remote_cmds = [c.args[1] for c in remote_mock.call_args_list]
+            self.assertEqual(remote_cmds, [
+                ["/usr/local/bin/workspace-transfer", "collect", snapshot],
+                ["/usr/local/bin/workspace-transfer", "cleanup", stage],
+            ])
+            run_mock.assert_called_once()
+            self.assertEqual(run_mock.call_args.args[0][0], "rsync")
+            fake_lib.restore.assert_called_once()
+            target = fake_lib.restore.call_args.args[0]
+            self.assertTrue((target / "retrieved.json").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

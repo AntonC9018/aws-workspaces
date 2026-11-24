@@ -26,15 +26,18 @@ recorded locally and on the instance for recovery if the local registry is lost.
 
 Wait for the registered job before fetching. Results go under
 `~/.local/state/coder-workspaces/results/<workspace>/<snapshot>-<suffix>`.
-`checkouts/<project>` contains reconstructed commits and dirty files;
+`manifest.json` records each project's synced `commit`, final `result_commit`,
+and `result_dirty` flag as historical metadata without saving repository
+checkouts, git bundles, patches, or untracked file archives.
 `<project>/artifacts` contains declared outputs; `extra` contains extra files.
 Hashes are checked before writing `retrieved.json`. Missing build outputs are
-recorded rather than preventing recovery of source changes from a failed job.
+recorded rather than preventing retrieval of the remaining results.
 
-Fetch leaves original local worktrees untouched. Inspect the result, then merge
-or cherry-pick deliberately. If the PC was off, resume the worker and fetch
-when the agent returns. There is no background retrieval service or automatic
-push. Keep important results locally before AWS credits or account access end.
+Fetch leaves original local worktrees untouched. If remote source edits should
+be kept, commit and push them explicitly from the worker with `authorize` before
+deleting it. If the PC was off, resume the worker and fetch when the agent
+returns. There is no background retrieval service or automatic push. Keep
+important results locally before AWS credits or account access end.
 
 The first version rejects submodules and selected symlinks. Declare submodules
 as separate projects. Git LFS needs manual materialization and checking; root
